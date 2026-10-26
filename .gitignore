@@ -1,0 +1,16 @@
+# 비밀
+.env
+# 영상/대용량 입력 (저장소에 커밋 금지)
+*.mov
+*.MOV
+*.mp4
+*.MP4
+*.m4v
+*.hevc
+# 작업/출력 산출물
+work/
+output/
+*.egg-info/
+__pycache__/
+.venv/
+.pytest_cache/
