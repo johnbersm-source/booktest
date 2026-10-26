@@ -24,7 +24,11 @@ def page_images(pdf: Path, h: int = 1280) -> list[np.ndarray]:
 
 def build(pdf: Path, out_mov: Path, codec: str = "libx264", rotation: int = 90, hold_s: float = 2.0,
           fps: int = 30) -> list[np.ndarray]:
-    pages = page_images(pdf)
+    return build_from_images(page_images(pdf), out_mov, codec, rotation, hold_s, fps)
+
+
+def build_from_images(pages: list[np.ndarray], out_mov: Path, codec: str = "libx264", rotation: int = 90,
+                      hold_s: float = 2.0, fps: int = 30, transition: int = 8) -> list[np.ndarray]:
     frames_dir = out_mov.parent / "vframes"
     shutil.rmtree(frames_dir, ignore_errors=True)
     frames_dir.mkdir(parents=True)
@@ -48,8 +52,8 @@ def build(pdf: Path, out_mov: Path, codec: str = "libx264", rotation: int = 90, 
             write(fr)
         if k + 1 < len(pages):  # 페이지 넘김: 옆으로 밀리며 섞이는 전환 + 모션블러
             nxt = pages[k + 1]
-            for t in range(1, 9):
-                a = t / 9
+            for t in range(1, transition + 1):
+                a = t / (transition + 1)
                 shift = int(a * pg.shape[1])
                 canvas = np.roll(pg, -shift, axis=1).astype(np.float32) * (1 - a) + np.roll(nxt, pg.shape[1] - shift, axis=1) * a
                 write(cv2.GaussianBlur(canvas.astype(np.uint8), (0, 0), 3))

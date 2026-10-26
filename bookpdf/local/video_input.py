@@ -1,15 +1,18 @@
 """[로컬 전용] .mov(아이폰 세로 영상 포함) → 페이지당 최선의 프레임 1장.
 
 가정용 PC에서만 실행한다. 필요: ffmpeg/ffprobe(PATH), opencv-python-headless, numpy.
-단계: ffmpeg 프레임 추출(회전 메타데이터 반영) → 흐린 프레임 제거(Laplacian 분산)
-      → 정지 구간 묶기(직전 프레임과 거의 동일) → 화면 변화량으로 페이지 넘김 감지
-      → 페이지당 가장 선명한 프레임 1장.
+단계(스트리밍): ffmpeg 가 디코딩한 프레임(회전 메타데이터 반영)을 파이프로 한 장씩 받아
+      → 흐린 프레임 제외(Laplacian 분산) → 정지 구간 묶기(직전 프레임과 같은 페이지)
+      → 페이지 넘김 감지 → 페이지당 가장 선명한 프레임 1장만 디스크에 저장.
+      전체 프레임을 디스크/메모리에 쌓지 않으므로 300~400쪽 분량의 긴 영상도 처리할 수 있다.
 """
 from __future__ import annotations
 
 import json
 import shutil
 import subprocess
+import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -19,6 +22,7 @@ CMP_W = 960             # 비교용 축소 폭. 480 은 글자 한 자보다 팽
 SAME_THR = 0.10         # 두 프레임의 '잉크 불일치 비율'이 이 값 미만이면 같은 페이지
                         # (합성 영상 실측: 같은 페이지 ≤0.004, 다른 페이지 ≥0.198. 실제 영상은 미검증 → --page-thr 로 조정)
 BLUR_REL = 0.5          # 영상 전체 선명도 중앙값 대비 이 비율 미만이면 '흐림'
+SINGLE_REL = 0.7        # 선명한 프레임이 1장뿐인 구간(빠른 넘김)은 중앙값의 이 비율 이상일 때만 페이지로 인정
 
 
 def _need(tool: str) -> str:
@@ -46,23 +50,6 @@ def probe(video: Path) -> dict:
     rot = int(st.get("tags", {}).get("rotate", rot) or rot)
     return {"codec": st.get("codec_name"), "width": st.get("width"), "height": st.get("height"),
             "rotation": rot, "duration": float(data.get("format", {}).get("duration", 0) or 0)}
-
-
-def extract_frames(video: Path, frame_dir: Path, fps: float) -> list[Path]:
-    """ffmpeg 로 fps 추출. 회전 메타데이터(display matrix)는 ffmpeg 의 autorotate 로 반영한다.
-    HEVC 디코딩도 ffmpeg 가 처리한다."""
-    frame_dir.mkdir(parents=True, exist_ok=True)
-    for old in frame_dir.glob("f*.jpg"):
-        old.unlink()
-    cmd = [_need("ffmpeg"), "-v", "error", "-y", "-i", str(video),
-           "-vf", f"fps={fps}", "-q:v", "2", str(frame_dir / "f%06d.jpg")]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg 프레임 추출 실패: {r.stderr.strip()[:400]}")
-    frames = sorted(frame_dir.glob("f*.jpg"))
-    if not frames:
-        raise RuntimeError("추출된 프레임이 없습니다.")
-    return frames
 
 
 def _sharpness(gray: np.ndarray) -> float:
@@ -99,86 +86,147 @@ def page_diff(ga: np.ndarray, gb: np.ndarray) -> float:
     return float(max((a & ~db).sum() / max(1, na), (b & ~da).sum() / max(1, nb)))
 
 
-def select_pages(frames: list[Path], min_run: int = 2, same_thr: float = SAME_THR) -> tuple[list[int], dict]:
-    """프레임 인덱스 목록(페이지당 1개)과 통계를 돌려준다. 메모리를 아끼려 스트리밍으로 처리한다."""
-    # 1패스: 선명도(흐림 기준용)
-    sharp: list[float] = []
-    for p in frames:
-        g = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
-        sharp.append(_sharpness(g) if g is not None else 0.0)
-    valid = [s for s in sharp if s > 0]
-    med = float(np.median(valid)) if valid else 1.0
-    blur_thr = med * BLUR_REL
-
-    # 2패스: 정지 구간(직전 프레임과 같은 페이지로 보이는 연속 프레임) 묶기
-    runs: list[tuple[list[int], np.ndarray]] = []   # (구간 프레임 인덱스, 대표 프레임 축소본)
-    cur: list[int] = []
-    cur_small: dict[int, np.ndarray] = {}
-    prev_small = None
-
-    def flush():
-        if len(cur) >= min_run:
-            ok = [i for i in cur if sharp[i] >= blur_thr] or cur
-            b = max(ok, key=lambda i: sharp[i])
-            runs.append((list(cur), cur_small[b]))
-    for i, p in enumerate(frames):
-        g = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
-        if g is None:
-            continue
-        sm = _small(g)
-        if cur and prev_small is not None and page_diff(prev_small, sm) < same_thr:
-            cur.append(i)
-        else:
-            flush()
-            cur, cur_small = [i], {}
-        cur_small[i] = sm
-        # 메모리: 구간 안에서는 가장 선명한 프레임의 축소본만 유지
-        if len(cur_small) > 2:
-            keep = max(cur_small, key=lambda j: sharp[j] if sharp[j] >= blur_thr else -1)
-            cur_small = {j: s for j, s in cur_small.items() if j in (keep, i)}
-        prev_small = sm
-    flush()
-    if not runs:  # 정지 구간이 없으면 가장 선명한 프레임 1장으로 폴백
-        best = max(range(len(frames)), key=lambda i: sharp[i])
-        return [best], {"추출 프레임": len(frames), "정지 구간": 0, "감지된 페이지": 1,
-                        "경고": "정지 구간을 찾지 못해 1장만 선택(--fps 를 올리거나 --page-thr 확인)"}
-
-    # 인접 구간 병합(손으로 잠깐 가린 경우 등) + 페이지당 가장 선명한 프레임
-    pages: list[int] = []
-    page_small: list[np.ndarray] = []
-    for idxs, sm in runs:
-        ok = [i for i in idxs if sharp[i] >= blur_thr] or idxs
-        b = max(ok, key=lambda i: sharp[i])
-        if page_small and page_diff(page_small[-1], sm) < same_thr:
-            if sharp[b] > sharp[pages[-1]]:
-                pages[-1], page_small[-1] = b, sm
-            continue
-        pages.append(b)
-        page_small.append(sm)
-    stats = {
-        "추출 프레임": len(frames), "정지 구간": len(runs), "감지된 페이지": len(pages),
-        "선명도 중앙값": round(med, 1), "흐림 기준": round(blur_thr, 1),
-        "선택 프레임 선명도": [round(sharp[i], 1) for i in pages],
-        "페이지 구분 기준(same_thr)": same_thr,
-    }
-    return pages, stats
+def _target_dims(info: dict, max_side: int) -> tuple[int, int]:
+    """회전 반영 후 출력 크기(짝수). 긴 변이 max_side 를 넘으면 축소."""
+    w, h = int(info["width"]), int(info["height"])
+    if abs(int(info.get("rotation", 0))) in (90, 270):
+        w, h = h, w
+    s = min(1.0, max_side / max(w, h))
+    return max(2, int(round(w * s / 2)) * 2), max(2, int(round(h * s / 2)) * 2)
 
 
-def extract_pages(video: Path, out_dir: Path, fps: float = 3.0, same_thr: float = SAME_THR) -> tuple[list[Path], dict]:
+def _read_exact(stream, n: int) -> bytes | None:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
+def _signature(video: Path, fps: float, same_thr: float, max_side: int) -> str:
+    st = video.stat()
+    return f"{st.st_size}:{st.st_mtime_ns}:{fps}:{same_thr}:{max_side}:v2"
+
+
+def extract_pages(video: Path, out_dir: Path, fps: float = 3.0, same_thr: float = SAME_THR,
+                  max_side: int = 2000, min_run: int = 1, log=print) -> tuple[list[Path], dict]:
+    """영상 → 페이지 이미지(p0001.jpg …). 같은 영상·설정으로 이미 끝났으면 다시 하지 않는다."""
     if not video.is_file():
         raise ValueError(f"파일이 없습니다: {video}")
     if not 0.5 <= fps <= 10:
         raise ValueError("fps 는 0.5~10 사이여야 합니다(권장 2~5).")
     info = probe(video)
-    frames = extract_frames(video, out_dir.parent / "frames", fps)
-    idx, stats = select_pages(frames, same_thr=same_thr)
     out_dir.mkdir(parents=True, exist_ok=True)
-    pages = []
-    for n, i in enumerate(idx, start=1):
-        dst = out_dir / f"p{n:04d}.jpg"
-        shutil.copyfile(frames[i], dst)
-        pages.append(dst)
-    first = cv2.imread(str(pages[0]))
-    info.update(stats)
-    info["출력 프레임 크기(WxH)"] = f"{first.shape[1]}x{first.shape[0]}"
+    state_path = out_dir / "_video_state.json"
+    sig = _signature(video, fps, same_thr, max_side)
+    if state_path.exists():
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        if st.get("signature") == sig and st.get("complete"):
+            pages = sorted(out_dir.glob("p*.jpg"))
+            if len(pages) == st["info"]["감지된 페이지"]:
+                log(f"영상 처리 결과가 이미 있어 건너뜁니다({len(pages)}쪽).")
+                return pages, st["info"]
+    for old in out_dir.glob("p*.jpg"):
+        old.unlink()
+    state_path.unlink(missing_ok=True)
+
+    W, H = _target_dims(info, max_side)
+    cmd = [_need("ffmpeg"), "-v", "error", "-i", str(video),
+           "-vf", f"fps={fps},scale={W}:{H}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=W * H * 3 * 2)
+    frame_bytes = W * H * 3
+    expected = max(1, int(info["duration"] * fps))
+    t0 = time.time()
+    last_log = t0
+
+    sharp_hist: deque[float] = deque(maxlen=300)
+    n_frames = 0
+    # 현재 정지 구간
+    run_len = 0
+    run_best_ok = None     # (선명도, 프레임, 축소본) — 흐리지 않은 것 중 최선
+    run_best_any = None    # 흐린 것 포함 최선(폴백)
+    prev_small = None
+    # 지금까지 확정된 페이지
+    pages: list[Path] = []
+    last_small = None
+    last_sharp = 0.0
+    n_runs = 0
+
+    def write(n: int, frame: np.ndarray) -> Path:
+        p = out_dir / f"p{n:04d}.jpg"
+        cv2.imwrite(str(p), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        return p
+
+    def close_run() -> None:
+        nonlocal last_small, last_sharp, n_runs
+        if run_len < 2:
+            # 한 프레임짜리 구간: 빠르게 넘기는 영상에서 선명한 샘플이 1장뿐인 쪽일 수 있다.
+            # 전환(페이지 넘김) 중 흐린 프레임이 가짜 쪽이 되지 않도록 선명한 것만 인정한다.
+            med = float(np.median(sharp_hist)) if sharp_hist else 0.0
+            if min_run > 1 or run_best_ok is None or run_best_ok[0] < SINGLE_REL * med:
+                return
+        elif run_len < min_run:
+            return
+        n_runs += 1
+        sharp, frame, sm = run_best_ok or run_best_any
+        if last_small is not None and page_diff(last_small, sm) < same_thr:
+            if sharp > last_sharp:          # 같은 페이지로 판정 → 더 선명한 쪽으로 교체
+                write(len(pages), frame)
+                last_small, last_sharp = sm, sharp
+            return
+        pages.append(write(len(pages) + 1, frame))
+        last_small, last_sharp = sm, sharp
+
+    try:
+        while True:
+            raw = _read_exact(proc.stdout, frame_bytes)
+            if raw is None:
+                break
+            frame = np.frombuffer(raw, np.uint8).reshape(H, W, 3)
+            n_frames += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            sharp = _sharpness(gray)
+            sm = _small(gray)
+            sharp_hist.append(sharp)
+            blur_thr = BLUR_REL * float(np.median(sharp_hist)) if len(sharp_hist) >= 10 else 0.0
+            if run_len and prev_small is not None and page_diff(prev_small, sm) < same_thr:
+                run_len += 1
+            else:
+                close_run()
+                run_len, run_best_ok, run_best_any = 1, None, None
+            prev_small = sm
+            cand = (sharp, frame.copy(), sm)
+            if run_best_any is None or sharp > run_best_any[0]:
+                run_best_any = cand
+            if sharp >= blur_thr and (run_best_ok is None or sharp > run_best_ok[0]):
+                run_best_ok = cand
+            now = time.time()
+            if now - last_log >= 20:
+                last_log = now
+                done = min(1.0, n_frames / expected)
+                rate = n_frames / max(1e-6, now - t0)
+                eta = (expected - n_frames) / max(1e-6, rate)
+                log(f"  영상 분석 {done:5.1%} ({n_frames}/{expected}프레임, {rate:.1f}프레임/초) "
+                    f"페이지 {len(pages)}개 감지, 남은 약 {eta / 60:.1f}분")
+        close_run()
+    finally:
+        proc.stdout.close()
+        err = proc.stderr.read().decode("utf-8", "replace")
+        proc.stderr.close()
+        rc = proc.wait()
+    if rc != 0 and n_frames == 0:
+        raise RuntimeError(f"ffmpeg 프레임 추출 실패(코드 {rc}): {err.strip()[:400]}")
+    if not pages:
+        if n_frames == 0:
+            raise RuntimeError("추출된 프레임이 없습니다.")
+        raise RuntimeError("정지 구간(페이지)을 찾지 못했습니다. --fps 를 올리거나 --page-thr 를 확인하세요.")
+    info.update({
+        "출력 프레임 크기(WxH)": f"{W}x{H}", "분석 프레임": n_frames, "정지 구간": n_runs,
+        "감지된 페이지": len(pages), "페이지 구분 기준(same_thr)": same_thr,
+        "선명도 중앙값": round(float(np.median(sharp_hist)), 1) if sharp_hist else 0,
+        "분석 소요(초)": round(time.time() - t0, 1),
+    })
+    state_path.write_text(json.dumps({"signature": sig, "complete": True, "info": info}, ensure_ascii=False), encoding="utf-8")
     return pages, info

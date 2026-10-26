@@ -18,6 +18,7 @@ class Settings:
     api_key: str
     model: str
     rpm: float
+    rpd: int = 0
 
 
 def load_settings() -> Settings:
@@ -26,4 +27,5 @@ def load_settings() -> Settings:
         api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
         model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip(),
         rpm=float(os.environ.get("GEMINI_RPM", "10")),
+        rpd=int(os.environ.get("GEMINI_RPD", "0") or 0),
     )

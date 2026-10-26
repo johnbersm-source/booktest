@@ -15,7 +15,7 @@ PROMPT = """당신은 책 스캔 페이지를 디지털 텍스트로 옮기는 O
 4. 표는 반드시 Markdown 표(| 열 | 열 |, 구분선 |---|---|)로 옮기세요.
 5. 사진·그림·도표·그래프(글자만으로 옮길 수 없는 영역)는 figures 에 box_2d 로 등록하고,
    본문의 해당 위치에 {{FIG:n}} (n은 figures 순번, 1부터) 마커를 넣으세요. 표는 그림이 아니라 Markdown 표로 옮기세요.
-6. 쪽번호와 머리글/바닥글은 본문에서 제외하세요.
+6. 머리글/바닥글은 본문에서 제외하세요. 페이지 하단·상단에 인쇄된 쪽번호(아라비아 숫자)는 본문에 넣지 말고 page_number 에만 정수로 적으세요(없거나 읽을 수 없으면 null).
 7. 문단은 빈 줄로 구분하고, 같은 문단 안의 줄바꿈은 그대로 두세요.
 8. confidence 는 이 페이지 전사의 신뢰도(0~1)를 정직하게 적으세요(흐림·잘림·손글씨면 낮게).
 box_2d 는 [ymin, xmin, ymax, xmax], 이미지 전체를 0~1000으로 정규화한 정수입니다."""
@@ -36,9 +36,19 @@ SCHEMA = {
             },
         },
         "confidence": {"type": "number"},
+        "page_number": {"type": "integer", "nullable": True},
     },
     "required": ["markdown", "figures", "confidence"],
 }
+
+
+class QuotaExhausted(RuntimeError):
+    """하루 사용량 한도(RPD 등)가 소진됨. 몇 시간 기다려도 풀리지 않으므로 재시도하지 않고 멈춘다."""
+
+
+def is_daily_quota_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(k in msg for k in ("perday", "per day", "daily", "requestsperday"))
 
 
 class RateLimiter:
@@ -90,10 +100,18 @@ def parse_response(text: str) -> dict:
         conf = float(data.get("confidence", 0.5))
     except (TypeError, ValueError):
         conf = 0.5
+    pn = data.get("page_number")
+    try:
+        pn = int(pn) if pn is not None and str(pn).strip().lstrip("-").isdigit() else None
+    except (TypeError, ValueError):
+        pn = None
+    if pn is not None and not 0 < pn < 10000:
+        pn = None
     return {
         "markdown": str(data["markdown"]),
         "figures": figs,
         "confidence": max(0.0, min(1.0, conf)),
+        "page_number": pn,
         "engine": "gemini",
     }
 
@@ -129,6 +147,8 @@ def make_gemini_ocr(api_key: str, model: str, rpm: float, max_attempts: int = 6,
                 log(f"  응답 형식 오류, 재시도 {attempt + 1}/{max_attempts}: {e}")
                 time.sleep(2)
             except Exception as e:  # noqa: BLE001
+                if is_daily_quota_error(e):
+                    raise QuotaExhausted(f"일일 한도 도달: {str(e)[:200]}") from e
                 delay = _retry_delay(e, attempt)
                 if delay is None:
                     raise

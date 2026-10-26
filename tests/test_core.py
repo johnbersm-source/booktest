@@ -10,7 +10,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 import make_sample  # noqa: E402
-from bookpdf import cli, ocr, pdf_input, pipeline, postprocess, report  # noqa: E402
+from bookpdf import cli, ocr, pdf_input, postprocess  # noqa: E402
 
 
 # ---------- ocr.parse_response ----------

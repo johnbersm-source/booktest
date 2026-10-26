@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
-from . import pdf_input, pipeline, postprocess, render, report
+from . import pdf_input, pipeline, postprocess, render, report, spread
 from .config import load_settings
 
 
@@ -40,6 +42,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fps", type=float, default=3.0, help="[.mov 로컬 전용] 초당 추출 프레임 수 (2~5 권장)")
     ap.add_argument("--page-thr", type=float, default=0.10,
                     help="[.mov 로컬 전용] 페이지 구분 민감도(0~1). 같은 페이지가 쪼개지면 올리고, 다른 페이지가 합쳐지면 내리세요")
+    ap.add_argument("--spread", choices=["auto", "on", "off"], default="auto",
+                    help="펼침면(좌/우 두 쪽이 한 장) 분리: auto=가로세로비+제본선 자동 판별(기본), on=모두 분리, off=분리 안 함")
+    ap.add_argument("--gutter-offset", type=float, default=0.0,
+                    help="제본선 위치 수동 보정(이미지 폭 비율, 예: 0.02=오른쪽으로 2%%, -0.02=왼쪽으로 2%%)")
+    ap.add_argument("--spread-overlap", type=float, default=0.015,
+                    help="분리 시 안쪽으로 겹쳐 자르는 폭(이미지 폭 비율, 기본 0.015). 글자 잘림 방지용")
+    ap.add_argument("--max-frame-side", type=int, default=2000, help="[.mov 로컬 전용] 프레임 긴 변 상한(px). 줄이면 메모리·업로드 감소")
+    ap.add_argument("--max-calls", type=int, default=0,
+                    help="이번 실행에서 Gemini 호출 최대 횟수(0=환경변수 GEMINI_RPD, 그것도 없으면 무제한). 도달하면 저장 후 멈춤")
+    ap.add_argument("--allow-partial", action="store_true", help="중단돼 미처리 쪽이 남아도 처리된 쪽만으로 책 PDF 생성")
+    ap.add_argument("--restart", action="store_true", help="이전 중간 결과(work)를 지우고 처음부터")
     ap.add_argument("--max-pages", type=int, default=0, help="앞쪽 N페이지만 처리(테스트용)")
     a = ap.parse_args(argv)
 
@@ -52,7 +65,27 @@ def main(argv: list[str] | None = None) -> int:
     extra: list[str] = []
     pdf_for_text: Path | None = None
 
-    # ---- 1. 입력 검증 + 페이지 이미지화
+    # ---- 0. 설정 서명: 설정이 바뀐 채 이어하면 이전 결과와 섞이므로 막는다
+    sig = {"input": inp.name, "size": inp.stat().st_size if inp.is_file() else None,
+           "mtime": inp.stat().st_mtime_ns if inp.is_file() else None,
+           "spread": a.spread, "gutter_offset": a.gutter_offset, "spread_overlap": a.spread_overlap,
+           "dpi": a.dpi, "fps": a.fps, "page_thr": a.page_thr, "max_frame_side": a.max_frame_side}
+    meta_path = work / "meta.json"
+    if a.restart and work.exists():
+        shutil.rmtree(work)
+        work.mkdir(parents=True, exist_ok=True)
+    if meta_path.exists():
+        old = json.loads(meta_path.read_text(encoding="utf-8"))
+        if old != sig:
+            diff = sorted(k for k in sig if old.get(k) != sig[k])
+            print(f"[설정 불일치] 이전 실행과 달라진 항목: {', '.join(diff)}\n"
+                  f"  이전 결과와 섞이지 않도록 중단합니다. 처음부터 하려면 --restart, 새 폴더를 쓰려면 --work 를 지정하세요.",
+                  file=sys.stderr)
+            return 2
+    else:
+        meta_path.write_text(json.dumps(sig, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    # ---- 1. 입력 검증 + 원본 이미지 만들기
     ext = inp.suffix.lower()
     if ext == ".pdf":
         try:
@@ -61,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[입력 오류] {e}", file=sys.stderr)
             return 2
         print(f"입력 PDF 확인: {n}쪽")
-        images = pdf_input.render_pages(inp, work / "page_images", a.dpi)
+        sources = pdf_input.render_pages(inp, work / "source_images", a.dpi)
         pdf_for_text = inp
     elif ext in (".mov", ".mp4", ".m4v"):
         try:
@@ -70,7 +103,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[영상 입력은 로컬 전용] 의존성이 없습니다: {e}\n  pip install -r requirements-video.txt 와 ffmpeg 설치가 필요합니다.", file=sys.stderr)
             return 2
         try:
-            images, vinfo = video_input.extract_pages(inp, work / "page_images", fps=a.fps, same_thr=a.page_thr)
+            sources, vinfo = video_input.extract_pages(inp, work / "source_images", fps=a.fps, same_thr=a.page_thr,
+                                                       max_side=a.max_frame_side)
         except (RuntimeError, ValueError) as e:
             print(f"[영상 처리 오류] {e}", file=sys.stderr)
             return 2
@@ -78,6 +112,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"[입력 오류] 지원하지 않는 형식입니다: {ext} (.pdf, 로컬 전용 .mov)", file=sys.stderr)
         return 2
+
+    # ---- 1b. 펼침면 분리 (단일 쪽 이미지는 그대로 통과)
+    images, spread_info = spread.expand_spreads(sources, work / "page_images", a.spread, a.gutter_offset, a.spread_overlap)
+    n_split = sum(1 for s in spread_info if s["kind"] == "left")
+    print(f"원본 {len(sources)}장 → 책 {len(images)}쪽 (펼침면 {n_split}장 분리, --spread {a.spread})")
+    if pdf_for_text is not None and n_split:
+        a.skip_ocr_if_text = False  # 분리된 쪽은 PDF 쪽 번호와 대응하지 않으므로 텍스트 레이어를 쓸 수 없다
     if a.max_pages:
         images = images[: a.max_pages]
 
@@ -89,7 +130,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Gemini 사용: 모델 {s.model}, RPM {s.rpm}")
     else:
         print("GEMINI_API_KEY 가 없습니다(.env 확인). 텍스트 레이어가 있는 PDF 페이지만 처리됩니다.")
-    results = pipeline.process_pages(images, work, ocr, pdf=pdf_for_text, use_textlayer=a.skip_ocr_if_text)
+    results, stopped = pipeline.process_pages(images, work, ocr, pdf=pdf_for_text, use_textlayer=a.skip_ocr_if_text,
+                                              max_calls=a.max_calls or s.rpd, rpm=s.rpm if ocr else 0.0)
+    pending = len(images) - len(results)
 
     # ---- 3. 후처리
     body, stats = postprocess.postprocess([namespaced_markdown(r) for r in results])
@@ -101,9 +144,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- 4. 책 PDF
     low = report.low_confidence_pages(results, a.threshold)
+    if stopped and not a.allow_partial:
+        report.write_report(out / "리포트.md", results, low, stats, extra, spread_info, pending)
+        print(f"[중단] 미처리 {pending}쪽이 남아 책 PDF 는 만들지 않았습니다(진행상황은 {work} 에 저장됨).\n"
+              f"  같은 명령을 다시 실행하면 이어서 처리합니다. 지금까지 분량만 보려면 --allow-partial.", file=sys.stderr)
+        return 5
     if not body.strip():
         print("[결과 오류] 추출된 텍스트가 없어 책 PDF를 만들지 않습니다. (API 키/입력을 확인하세요)", file=sys.stderr)
-        report.write_report(out / "리포트.md", results, low, stats, extra)
+        report.write_report(out / "리포트.md", results, low, stats, extra, spread_info, pending)
         return 3
     title = a.title or inp.stem
     html_str = render.build_html(body, build_figure_map(results), title, render.default_subtitle())
@@ -111,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     render.build_pdf(html_str, pdf_path, allowed_dirs=[work])
 
     # ---- 5. 결과 검증 + 리포트
-    report.write_report(out / "리포트.md", results, low, stats, extra)
+    report.write_report(out / "리포트.md", results, low, stats, extra, spread_info, pending)
     problems = _verify(pdf_path, results)
     print(f"완료: {pdf_path} ({pdf_path.stat().st_size // 1024} KB)")
     print(f"신뢰도 낮은 페이지 {len(low)}개 → {out / '리포트.md'}")

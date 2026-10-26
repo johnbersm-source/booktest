@@ -8,9 +8,11 @@
 from __future__ import annotations
 
 import math
+import re
 
 import pymupdf as fitz
 
+_PAGENO = re.compile(r"^[-–—\s]*(\d{1,4})[-–—\s]*$")
 _SENT_END = tuple(".?!。…”\"')」』:;)")
 
 
@@ -70,6 +72,7 @@ def extract_page(page: fitz.Page) -> dict:
 
     prev_text: list[tuple[float, str]] = []
     prev_head, prev_y1 = False, 0.0
+    page_number = None
     for b in blocks:
         r = fitz.Rect(b["bbox"])
         if any(r.intersects(t) and (r & t).get_area() > 0.5 * r.get_area() for t in table_rects):
@@ -81,6 +84,13 @@ def extract_page(page: fitz.Page) -> dict:
             figures.append({"box_2d": _norm_box(r, prect), "caption": ""})
             items.append((r.y0, "{{FIG:%d}}" % len(figures)))
             continue
+        if b["type"] == 0:
+            raw = " ".join("".join(s["text"] for s in ln["spans"]) for ln in b["lines"]).strip()
+            m = _PAGENO.match(raw)
+            near_edge = r.y1 < prect.y0 + 0.10 * prect.height or r.y0 > prect.y0 + 0.88 * prect.height
+            if m and near_edge:           # 상단/하단의 숫자만 있는 블록 = 인쇄된 쪽번호
+                page_number = int(m.group(1))
+                continue
         lines = []
         mx = 0.0
         for ln in b["lines"]:
@@ -111,5 +121,6 @@ def extract_page(page: fitz.Page) -> dict:
         "markdown": "\n\n".join(t for _, t in items if t.strip()),
         "figures": figures,
         "confidence": 0.95 if items else 0.0,
+        "page_number": page_number,
         "engine": "textlayer",
     }
