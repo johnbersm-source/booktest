@@ -8,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import pagesel, pdf_input, pipeline, postprocess, render, report, spread, structure
+from . import glyphs, pagesel, pdf_input, pipeline, postprocess, render, report, spread, structure
 from .config import load_settings
 
 
@@ -190,8 +190,13 @@ def main(argv: list[str] | None = None) -> int:
         fig_map.update(emb)
         extra += ["## 책 조립(tesseract)", ""] + [f"- {k}: {v}" for k, v in sstats.items()]
         page_mds = mds
+        md_pages = [r["page"] for r in results if r.get("engine") == "tesseract"]
     else:
         page_mds = [namespaced_markdown(r) for r in results]
+        md_pages = [r["page"] for r in results]
+    # 글꼴에 없는 글자(한자·원문자 등)를 PDF 만들기 전에 모아 리포트에 남긴다
+    glyph_found = glyphs.scan(list(zip(md_pages, page_mds)))
+    glyph_lines = glyphs.format_report(glyph_found)
     body, stats = postprocess.postprocess(page_mds)
     if a.ocr == "tesseract":
         toc_entries = structure.match_toc_to_body(toc_all, body)
@@ -204,13 +209,13 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 4. 책 PDF
     low = report.low_confidence_pages(results, a.threshold if a.threshold is not None else (0.6 if a.ocr == "tesseract" else 0.7))
     if stopped and not a.allow_partial:
-        report.write_report(out / "리포트.md", results, low, stats, extra, spread_info, pending)
+        report.write_report(out / "리포트.md", results, low, stats, extra + glyph_lines, spread_info, pending)
         print(f"[중단] 미처리 {pending}쪽이 남아 책 PDF 는 만들지 않았습니다(진행상황은 {work} 에 저장됨).\n"
               f"  같은 명령을 다시 실행하면 이어서 처리합니다. 지금까지 분량만 보려면 --allow-partial.", file=sys.stderr)
         return 5
     if not body.strip():
         print("[결과 오류] 추출된 텍스트가 없어 책 PDF를 만들지 않습니다. (API 키/입력을 확인하세요)", file=sys.stderr)
-        report.write_report(out / "리포트.md", results, low, stats, extra, spread_info, pending)
+        report.write_report(out / "리포트.md", results, low, stats, extra + glyph_lines, spread_info, pending)
         return 3
     title = a.title or inp.stem
     html_str = render.build_html(body, fig_map, title, render.default_subtitle(), toc_entries)
@@ -218,8 +223,8 @@ def main(argv: list[str] | None = None) -> int:
     render.build_pdf(html_str, pdf_path, allowed_dirs=[work])
 
     # ---- 5. 결과 검증 + 리포트
-    report.write_report(out / "리포트.md", results, low, stats, extra, spread_info, pending)
-    problems = _verify(pdf_path, results)
+    report.write_report(out / "리포트.md", results, low, stats, extra + glyph_lines, spread_info, pending)
+    problems = _verify(pdf_path, results, bool(glyph_found["cjk"]))
     print(f"완료: {pdf_path} ({pdf_path.stat().st_size // 1024} KB)")
     print(f"신뢰도 낮은 페이지 {len(low)}개 → {out / '리포트.md'}")
     for p in problems:
@@ -232,7 +237,7 @@ def ocr_kind_label(kind: str) -> str:
     return KIND_LABEL.get(kind, kind)
 
 
-def _verify(pdf: Path, results: list[dict]) -> list[str]:
+def _verify(pdf: Path, results: list[dict], expect_cjk: bool = False) -> list[str]:
     """생성된 PDF 를 다시 열어 페이지 수/글자/그림/폰트 포함 여부를 확인."""
     import pymupdf as fitz
     issues = []
@@ -249,6 +254,8 @@ def _verify(pdf: Path, results: list[dict]) -> list[str]:
     fonts = {f[3] for p in doc for f in p.get_fonts()}
     if not any("Nanum" in f for f in fonts):
         issues.append(f"NanumGothic 폰트가 포함되지 않았습니다(포함된 폰트: {sorted(fonts)}).")
+    if expect_cjk and not any("Noto" in f for f in fonts):
+        issues.append("한자·CJK 기호가 있는데 Noto Sans CJK KR 글꼴이 PDF 에 포함되지 않았습니다(빈칸일 수 있음).")
     doc.close()
     return issues
 

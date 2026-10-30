@@ -5,6 +5,7 @@
 
 ## 확정된 설계 결정 (되돌리지 말 것)
 - PDF 생성은 **xhtml2pdf + NanumGothic**(`bookpdf/fonts/`에 번들, OFL 라이선스). WeasyPrint는 쓰지 않음(Windows GTK 문제).
+- NanumGothic 에 없는 글자: 한자·CJK 기호는 **Noto Sans CJK KR 부분집합**(번들, OFL, `NotoSansCJKkr-*.ttf`)으로, 원문자(①❶㉠ 등)는 `(1)`·`(가)` 로 대체, 어느 글꼴에도 없으면 `□`. 아래 '글꼴에 없는 글자' 참고.
 - OCR은 Claude API가 아니라 **Gemini**(무료/구독 티어). 키는 `.env`로만 받고 커밋하지 않음.
 - 영상(.mov) 처리는 `bookpdf/local/` 에 분리된 **로컬 전용** 모듈. 영상 파일은 `.gitignore` 처리.
 
@@ -61,6 +62,18 @@ python -m bookpdf 책.pdf --ocr tesseract --dpi 300 --pages 114-215 --embed-page
   분당 한도(RPM)는 대기 후 재시도하고, 계속 막히면 `GEMINI_RPM` 을 낮추라고 안내하며 멈춥니다. 일일 한도는 미국 태평양시 자정에 초기화(공식 문서 기준).
 - 기본 모델은 코드에 `gemini-2.5-flash` 로 들어 있고 `.env` 의 `GEMINI_MODEL` 이 우선합니다. `gemini-3.8-flash` 는 이 세션에서 확인하지 못해 기본값으로 바꾸지 않았습니다.
 
+## 글꼴에 없는 글자 (한자·원문자)
+- xhtml2pdf 는 글리프가 없는 글자를 **빈칸**으로 그립니다. 그래서 PDF 를 만들기 전에 모든 글자를 점검합니다(`bookpdf/glyphs.py`).
+  | 글자 | 처리 |
+  |---|---|
+  | 한자(KS X 1001 4,888자 포함 약 6,600자)·가나·CJK 기호·도형 등 NanumGothic 에 없고 Noto 에 있는 글자 | 그 글자만 `<span class="cjk">` 로 감싸 Noto Sans CJK KR 로 표시(굵은 제목은 Bold) |
+  | 원문자 ①–⑳ ❶–❿ ➀–➓ Ⓐ–ⓩ ㉠–㉻ ㊱–㊿ ㈜ 등 | `(1)`–`(10)`, `(가)`, `(주)` 등 안전한 문자로 대체(Noto 에 글리프가 있어도 대체) |
+  | 두 글꼴 모두에 없는 글자 | `□` 로 대체(빈칸으로 사라지는 것을 방지) — **원문 확인 필요** |
+- `리포트.md` 의 '글꼴에 없는 글자' 에 종류별로 글자·코드포인트·횟수·쪽 번호가 나옵니다(생성 전 원문 기준, 상위 40종).
+- 한자·CJK 기호가 있는데 PDF 에 Noto 글꼴이 안 들어갔으면 `[검증 경고]`(exit 4).
+- Noto 부분집합은 `tools/make_cjk_font.py` 로 만들었습니다(개발자용, `pip install fonttools` 필요). reportlab 이 CFF(OTF/TTC)를 읽지 못해
+  TrueType 윤곽으로 변환했으며, 사용자는 실행할 필요가 없습니다. 부분집합 밖의 한자(간체자·희귀자)는 `□` 로 나가고 리포트에 남습니다.
+
 ## 처리 순서
 1. **입력 검증**: 파일 존재/암호/페이지 수(PDF), ffprobe 스트림·회전(영상).
 2. **페이지 이미지화**: PDF → PyMuPDF 렌더. 영상 → ffmpeg(HEVC 디코딩, 회전 메타데이터 반영) 프레임을 **파이프로 한 장씩 스트리밍**
@@ -88,6 +101,8 @@ python -m bookpdf 책.pdf --ocr tesseract --dpi 300 --pages 114-215 --embed-page
 | tesseract 모드 (합성 A4 300dpi 스캔 6쪽: 머리글·쪽번호 제거, 제목, 차트 쪽 삽입, 목차, `--pages`, 이어하기, 엔진/범위 변경 거부) | 합성 데이터로 **검증**(Linux, tesseract 5.3.4 + kor) |
 | tesseract 의 **실제 책 스캔** 인식 품질·제목 판정·`--embed-*` 임계값 | **미검증**. 합성 글꼴에서는 한글 음절 사이 공백·조각난 블록이 나왔고 제목 1개는 아예 인식 못 함 |
 | Gemini 429 일일/분당 구분 | 가짜 클라이언트로 **검증**(실제 오류 문구는 미확인) |
+| 한자·원문자 (합성 PDF: 텍스트 레이어의 兵赤黑三·❶–❹·⑩·㉠ → 책 PDF) | 합성 데이터로 **검증**: 한자는 Noto 로 텍스트 추출·잉크 비율 확인(글리프 있음 0.165 / 없음 0.0), 원문자는 (1)… 치환, 리포트 목록 |
+| 한자·원문자 (tesseract/Gemini 로 읽은 실제 책, 세로쓰기·한자 혼용 본문) | **미검증** (tesseract kor+eng 는 한자를 인식하지 못함 — 한자 인식은 Gemini 경로 몫) |
 | Windows/macOS 에서의 실행 | **미검증**(Linux 에서만 실행). 폰트는 번들되어 GTK 의존 없음 |
 
 ## 알려진 한계

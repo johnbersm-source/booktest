@@ -10,6 +10,7 @@ import markdown as md
 from PIL import Image
 from xhtml2pdf import pisa
 
+from . import glyphs
 from .config import FONT_BOLD, FONT_REGULAR
 
 MAX_IMG_W = 440  # A4 본문 폭(pt) 이내
@@ -18,6 +19,9 @@ MAX_IMG_H = 600
 CSS = """
 @font-face {{ font-family: NanumGothic; src: url("{reg}"); }}
 @font-face {{ font-family: NanumGothic; font-weight: bold; src: url("{bold}"); }}
+@font-face {{ font-family: NotoCJK; src: url("{cjk}"); }}
+@font-face {{ font-family: NotoCJK; font-weight: bold; src: url("{cjkb}"); }}
+.cjk {{ font-family: NotoCJK; }}
 @page {{ size: A4; margin: 2.2cm 2cm 2.2cm 2cm;
   @frame footer {{ -pdf-frame-content: footer; bottom: 0.8cm; margin-left: 2cm; margin-right: 2cm; height: 0.8cm; }} }}
 body {{ font-family: NanumGothic; font-size: 10.5pt; line-height: 150%; }}
@@ -50,7 +54,7 @@ def _img_html(path: str, caption: str, frac_w: float = 1.0) -> str:
     th = tw * h / w
     if th > MAX_IMG_H:
         tw, th = tw * MAX_IMG_H / th, MAX_IMG_H
-    cap = f'<p class="cap">{html.escape(caption)}</p>' if caption else ""
+    cap = f'<p class="cap">{glyphs.text_to_html(caption)}</p>' if caption else ""
     return (f'<div class="fig"><img src="{Path(path).resolve().as_posix()}" '
             f'width="{int(tw)}" height="{int(th)}" />{cap}</div>')
 
@@ -69,8 +73,8 @@ def build_html(body_md: str, figures: dict[str, dict], title: str, subtitle: str
                                 figures[key].get("frac_w", 1.0))
         return tok
 
-    body_md = re.sub(r"\{\{FIG:([\w\-]+)\}\}", sub, _escape_raw_html(body_md))
-    body = md.markdown(body_md, extensions=["tables", "sane_lists"])
+    body_md = re.sub(r"\{\{FIG:([\w\-]+)\}\}", sub, _escape_raw_html(glyphs.normalize(body_md)))
+    body = glyphs.wrap_cjk(md.markdown(body_md, extensions=["tables", "sane_lists"]))   # 토큰 치환 전: 그림 캡션이 두 번 감싸이지 않게
     body = body.replace("<table>", '<table border="1" cellpadding="4" cellspacing="0" repeat="1">')
     for tok, h in tokens.items():
         body = body.replace(f"<p>{tok}</p>", h).replace(tok, h)
@@ -81,19 +85,20 @@ def build_html(body_md: str, figures: dict[str, dict], title: str, subtitle: str
             cls = "toc-item" + (" toc-l2" if e["level"] == 2 else "")
             pn = e.get("printed")
             ref = f' <span class="cap">…… 원본 {"~" if e.get("est") else ""}{pn}쪽</span>' if pn else ""
-            toc.append(f'<p class="{cls}">{html.escape(e["text"])}{ref}</p>')
+            toc.append(f'<p class="{cls}">{glyphs.text_to_html(e["text"])}{ref}</p>')
     else:
         for m in re.finditer(r"<h([12])>(.*?)</h\1>", body, re.S):
             cls = "toc-item" + (" toc-l2" if m.group(1) == "2" else "")
             toc.append(f'<p class="{cls}">{re.sub("<.*?>", "", m.group(2))}</p>')
     toc_html = ""
     if toc:
-        toc_html = "<h1>목차</h1>" + "".join(toc[:200]) + "<pdf:nextpage />"
+        toc_html = "<h1>목차</h1>" + glyphs.wrap_cjk("".join(toc[:200])) + "<pdf:nextpage />"
 
-    css = CSS.format(reg=FONT_REGULAR.resolve().as_posix(), bold=FONT_BOLD.resolve().as_posix())
+    css = CSS.format(reg=FONT_REGULAR.resolve().as_posix(), bold=FONT_BOLD.resolve().as_posix(),
+                     cjk=glyphs.CJK_REGULAR.resolve().as_posix(), cjkb=glyphs.CJK_BOLD.resolve().as_posix())
     return f"""<html><head><meta charset="utf-8"/><style>{css}</style></head><body>
-<div class="cover-title">{html.escape(title)}</div>
-<div class="cover-sub">{html.escape(subtitle)}</div>
+<div class="cover-title">{glyphs.text_to_html(title)}</div>
+<div class="cover-sub">{glyphs.text_to_html(subtitle)}</div>
 <pdf:nextpage />
 {toc_html}
 {body}
