@@ -43,12 +43,31 @@ SCHEMA = {
 
 
 class QuotaExhausted(RuntimeError):
-    """하루 사용량 한도(RPD 등)가 소진됨. 몇 시간 기다려도 풀리지 않으므로 재시도하지 않고 멈춘다."""
+    """호출 한도 때문에 더 진행할 수 없음. kind: daily(일일, 몇 시간 기다려도 안 풀림) / minute(분당 한도가 계속 막음) / unknown."""
+
+    def __init__(self, msg: str = "", kind: str = "daily"):
+        super().__init__(msg)
+        self.kind = kind
+
+
+KIND_LABEL = {"daily": "일일 한도(RPD)", "minute": "분당 한도(RPM)", "unknown": "한도 종류 불명"}
 
 
 def is_daily_quota_error(err: Exception) -> bool:
     msg = str(err).lower()
     return any(k in msg for k in ("perday", "per day", "daily", "requestsperday"))
+
+
+def classify_quota_error(err: Exception) -> str | None:
+    """429/RESOURCE_EXHAUSTED 오류를 daily / minute / unknown 으로 구분. 한도 오류가 아니면 None."""
+    msg = str(err).lower()
+    if not (getattr(err, "code", None) == 429 or "resource_exhausted" in msg or "429" in msg):
+        return None
+    if is_daily_quota_error(err):
+        return "daily"
+    if any(k in msg for k in ("perminute", "per minute", "per_minute", "requestsperminute")):
+        return "minute"
+    return "unknown"
 
 
 class RateLimiter:
@@ -129,6 +148,7 @@ def make_gemini_ocr(api_key: str, model: str, rpm: float, max_attempts: int = 6,
         data = image_path.read_bytes()
         mime = "image/jpeg" if image_path.suffix.lower() in (".jpg", ".jpeg") else "image/png"
         last: Exception | None = None
+        last_kind: str | None = None
         for attempt in range(max_attempts):
             limiter.wait()
             try:
@@ -147,14 +167,19 @@ def make_gemini_ocr(api_key: str, model: str, rpm: float, max_attempts: int = 6,
                 log(f"  응답 형식 오류, 재시도 {attempt + 1}/{max_attempts}: {e}")
                 time.sleep(2)
             except Exception as e:  # noqa: BLE001
-                if is_daily_quota_error(e):
-                    raise QuotaExhausted(f"일일 한도 도달: {str(e)[:200]}") from e
+                kind = classify_quota_error(e)
+                if kind == "daily":
+                    raise QuotaExhausted(f"일일 한도(RPD) 도달: {str(e)[:200]}", "daily") from e
                 delay = _retry_delay(e, attempt)
                 if delay is None:
                     raise
-                last = e
-                log(f"  호출 제한/일시 오류, {delay:.0f}초 대기 후 재시도 {attempt + 1}/{max_attempts}: {str(e)[:160]}")
+                last, last_kind = e, kind
+                what = {"minute": "분당 한도(RPM) 초과", "unknown": "429 (분당/일일 구분 불가)"}.get(kind or "", "일시 오류")
+                log(f"  {what}, {delay:.0f}초 대기 후 재시도 {attempt + 1}/{max_attempts}: {str(e)[:160]}")
                 time.sleep(delay)
+        if last_kind:  # 429 가 끝까지 풀리지 않음: 다음 쪽으로 넘어가 계속 두드리지 말고 멈춘다
+            hint = "GEMINI_RPM 을 낮춰 다시 실행" if last_kind == "minute" else "잠시 후(또는 내일) 다시 실행"
+            raise QuotaExhausted(f"{KIND_LABEL[last_kind]}: 429 가 {max_attempts}회 연속 — {hint}. {str(last)[:160]}", last_kind)
         raise RuntimeError(f"OCR 실패(재시도 {max_attempts}회 소진): {last}")
 
     return ocr

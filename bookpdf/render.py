@@ -55,7 +55,8 @@ def _img_html(path: str, caption: str, frac_w: float = 1.0) -> str:
             f'width="{int(tw)}" height="{int(th)}" />{cap}</div>')
 
 
-def build_html(body_md: str, figures: dict[str, dict], title: str, subtitle: str) -> str:
+def build_html(body_md: str, figures: dict[str, dict], title: str, subtitle: str,
+               toc_entries: list[dict] | None = None) -> str:
     """figures: 마커 'FIGKEY' → {path, caption}. 본문의 {{FIG:key}} 를 이미지로 치환한다."""
     tokens: dict[str, str] = {}
 
@@ -75,9 +76,16 @@ def build_html(body_md: str, figures: dict[str, dict], title: str, subtitle: str
         body = body.replace(f"<p>{tok}</p>", h).replace(tok, h)
 
     toc = []
-    for m in re.finditer(r"<h([12])>(.*?)</h\1>", body, re.S):
-        cls = "toc-item" + (" toc-l2" if m.group(1) == "2" else "")
-        toc.append(f'<p class="{cls}">{re.sub("<.*?>", "", m.group(2))}</p>')
+    if toc_entries is not None:  # 원본 쪽번호가 붙은 목차(tesseract 모드). 인쇄 쪽번호가 없으면 번호 생략
+        for e in toc_entries:
+            cls = "toc-item" + (" toc-l2" if e["level"] == 2 else "")
+            pn = e.get("printed")
+            ref = f' <span class="cap">…… 원본 {"~" if e.get("est") else ""}{pn}쪽</span>' if pn else ""
+            toc.append(f'<p class="{cls}">{html.escape(e["text"])}{ref}</p>')
+    else:
+        for m in re.finditer(r"<h([12])>(.*?)</h\1>", body, re.S):
+            cls = "toc-item" + (" toc-l2" if m.group(1) == "2" else "")
+            toc.append(f'<p class="{cls}">{re.sub("<.*?>", "", m.group(2))}</p>')
     toc_html = ""
     if toc:
         toc_html = "<h1>목차</h1>" + "".join(toc[:200]) + "<pdf:nextpage />"

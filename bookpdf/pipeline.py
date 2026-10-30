@@ -10,7 +10,7 @@ import pymupdf as fitz
 from PIL import Image
 
 from . import textlayer
-from .ocr import QuotaExhausted
+from .ocr import KIND_LABEL, QuotaExhausted
 
 
 def crop_figures(image_path: Path, figures: list[dict], fig_dir: Path, page_no: int) -> list[dict]:
@@ -28,6 +28,21 @@ def crop_figures(image_path: Path, figures: list[dict], fig_dir: Path, page_no: 
         img.crop(box).save(p)
         out.append({**f, "n": n, "path": str(p)})
     return out
+
+
+def write_quota_hint(work: Path, kind: str, ok_calls: int, message: str) -> None:
+    """한도에 걸린 기록. 다음 실행에서 --max-calls 를 얼마로 둘지 안내하는 데 쓴다."""
+    (work / "quota_hint.json").write_text(json.dumps(
+        {"kind": kind, "successful_calls": max(0, ok_calls), "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+         "message": message[:300]}, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def read_quota_hint(work: Path) -> dict | None:
+    p = work / "quota_hint.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    except (OSError, ValueError):
+        return None
 
 
 def fmt_duration(sec: float) -> str:
@@ -51,11 +66,12 @@ def process_pages(
     max_calls: int = 0,
     rpm: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
+    pdf_page_map: list[int] | None = None,
 ) -> tuple[list[dict], str | None]:
     """각 페이지 결과를 work/pages/pNNNN.json 으로 저장. 이미 있으면 건너뛴다.
 
     반환: (결과 목록, 중단 사유). 중단 사유는 일일 한도 도달/호출 상한 도달 시에만 문자열,
-    정상이면 None. 중단되면 남은 쪽은 결과에 포함되지 않으며, 같은 명령으로 다시 실행하면 이어서 처리한다.
+    정상이면 None. pdf_page_map[i-1] 은 i번째 쪽에 대응하는 PDF 쪽 번호(1부터, --pages 사용 시). 중단되면 남은 쪽은 결과에 포함되지 않으며, 같은 명령으로 다시 실행하면 이어서 처리한다.
     """
     res_dir = work / "pages"
     res_dir.mkdir(parents=True, exist_ok=True)
@@ -79,14 +95,14 @@ def process_pages(
                 continue
             res: dict | None = None
             if doc is not None:
-                tl = textlayer.extract_page(doc[i - 1])
+                tl = textlayer.extract_page(doc[(pdf_page_map[i - 1] if pdf_page_map else i) - 1])
                 if tl["markdown"].strip():
                     res = tl
             if res is None:
                 if ocr is None:
                     # 캐시하지 않는다: 나중에 키를 넣고 재실행하면 이 페이지를 다시 처리해야 함
                     results.append({"page": i, "markdown": "", "figures": [], "confidence": 0.0,
-                                    "engine": "none", "error": "OCR 엔진 없음(GEMINI_API_KEY 미설정)"})
+                                    "engine": "none", "error": "OCR 엔진 없음(GEMINI_API_KEY 미설정, --ocr tesseract 로 대체 가능)"})
                     log(f"[{i}/{total}] OCR 엔진 없음, 건너뜀(캐시하지 않음)")
                     continue
                 if max_calls and ocr_calls >= max_calls:
@@ -97,13 +113,14 @@ def process_pages(
                     res = ocr(img)
                 except QuotaExhausted as e:
                     stop = str(e)
-                    log(f"[{i}/{total}] {e}")
+                    log(f"[{i}/{total}] [{KIND_LABEL.get(e.kind, e.kind)}] {e}")
+                    write_quota_hint(work, e.kind, ocr_calls - 1, str(e))
                     break
                 except Exception as e:  # noqa: BLE001  한 페이지 실패가 전체를 막지 않게
                     log(f"[{i}/{total}] OCR 실패: {e}")
                     # 실패는 저장하지 않아 다음 실행에서 재시도
                     results.append({"page": i, "markdown": "", "figures": [], "confidence": 0.0,
-                                    "engine": "gemini", "error": str(e)})
+                                    "engine": "ocr", "error": str(e)})
                     continue
             res["page"] = i
             res["image"] = str(img)
@@ -114,7 +131,7 @@ def process_pages(
             progress_path.write_text(json.dumps({"total": total, "done": done_now}), encoding="utf-8")
             results.append(res)
             elapsed = clock() - t0
-            this_run = max(1, ocr_calls) if res["engine"] == "gemini" else None
+            this_run = max(1, ocr_calls) if res["engine"] in ("gemini", "tesseract") else None
             msg = f"[{i}/{total}] {res['engine']} 완료 (신뢰도 {res['confidence']:.2f}, 그림 {len(res['figures'])})"
             if this_run and ocr_calls:
                 per = elapsed / ocr_calls

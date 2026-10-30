@@ -8,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import pdf_input, pipeline, postprocess, render, report, spread
+from . import pagesel, pdf_input, pipeline, postprocess, render, report, spread, structure
 from .config import load_settings
 
 
@@ -38,7 +38,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--title", default=None, help="표지 제목 (기본: 입력 파일명)")
     ap.add_argument("--dpi", type=int, default=200, help="PDF 페이지 렌더 DPI")
     ap.add_argument("--skip-ocr-if-text", action="store_true", help="텍스트 레이어가 있는 PDF 페이지는 OCR 생략")
-    ap.add_argument("--threshold", type=float, default=0.7, help="신뢰도 낮음 기준 (기본 0.7)")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="신뢰도 낮음 기준 (기본: gemini 0.7, tesseract 0.6 — tesseract 기준값은 실제 책으로 미검증)")
+    ap.add_argument("--ocr", choices=["gemini", "tesseract"], default="gemini",
+                    help="글자 인식 엔진. gemini=API(일일 한도 있음), tesseract=로컬(kor+eng, 한도 없음, 이어하기 지원)")
+    ap.add_argument("--pages", default=None, help="처리할 쪽 범위(PDF는 원본 쪽 번호, 영상은 추출된 장 번호). 예: 114-215 또는 1-3,10")
+    ap.add_argument("--embed-page-images", action="store_true",
+                    help="[tesseract] 글자가 적고 그림이 많은 쪽은 원본 쪽 이미지를 그대로 책에 삽입(제목만 글자로 유지)")
+    ap.add_argument("--heading-ratio", type=float, default=1.25,
+                    help="[tesseract] 글자 높이가 본문의 이 배수 이상이면 중제목(##), 1.2배 이상이면 대제목(#). 제목이 과다하면 올리고 빠지면 내리세요 (기본 1.25)")
+    ap.add_argument("--embed-min-chars", type=int, default=120, help="[tesseract] 이 글자 수 미만인 쪽을 '글자가 적은 쪽'으로 봄 (기본 120)")
+    ap.add_argument("--embed-min-ink", type=float, default=0.04, help="[tesseract] 배경과 다른 화소 비율이 이 이상이어야 삽입 (기본 0.04, 빈 쪽 제외)")
     ap.add_argument("--fps", type=float, default=3.0, help="[.mov 로컬 전용] 초당 추출 프레임 수 (2~5 권장)")
     ap.add_argument("--page-thr", type=float, default=0.10,
                     help="[.mov 로컬 전용] 페이지 구분 민감도(0~1). 같은 페이지가 쪼개지면 올리고, 다른 페이지가 합쳐지면 내리세요")
@@ -57,6 +67,19 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     inp: Path = a.input
+    sel: list[int] | None = None
+    if a.pages:
+        try:
+            sel = pagesel.parse_pages(a.pages)
+        except ValueError as e:
+            print(f"[입력 오류] {e}", file=sys.stderr)
+            return 2
+    if a.ocr == "tesseract":
+        from . import ocr_tesseract
+        msg = ocr_tesseract.check_available("kor+eng")
+        if msg:
+            print(f"[tesseract 사용 불가] {msg}", file=sys.stderr)
+            return 2
     out: Path = a.out
     work: Path = a.work or (out / "work")
     out.mkdir(parents=True, exist_ok=True)
@@ -69,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     sig = {"input": inp.name, "size": inp.stat().st_size if inp.is_file() else None,
            "mtime": inp.stat().st_mtime_ns if inp.is_file() else None,
            "spread": a.spread, "gutter_offset": a.gutter_offset, "spread_overlap": a.spread_overlap,
-           "dpi": a.dpi, "fps": a.fps, "page_thr": a.page_thr, "max_frame_side": a.max_frame_side}
+           "ocr": a.ocr, "pages": a.pages, "dpi": a.dpi, "fps": a.fps, "page_thr": a.page_thr, "max_frame_side": a.max_frame_side}
     meta_path = work / "meta.json"
     if a.restart and work.exists():
         shutil.rmtree(work)
@@ -94,7 +117,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[입력 오류] {e}", file=sys.stderr)
             return 2
         print(f"입력 PDF 확인: {n}쪽")
-        sources = pdf_input.render_pages(inp, work / "source_images", a.dpi)
+        if sel is not None and sel[-1] > n:
+            print(f"[입력 오류] --pages {a.pages} 가 전체 {n}쪽을 넘습니다.", file=sys.stderr)
+            return 2
+        sources = pdf_input.render_pages(inp, work / "source_images", a.dpi, sel,
+                                         max_side=3600 if a.ocr == "tesseract" else pdf_input.MAX_SIDE)
         pdf_for_text = inp
     elif ext in (".mov", ".mp4", ".m4v"):
         try:
@@ -109,6 +136,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[영상 처리 오류] {e}", file=sys.stderr)
             return 2
         extra += ["## 영상 입력 정보", ""] + [f"- {k}: {v}" for k, v in vinfo.items()]
+        if sel is not None:
+            if sel[-1] > len(sources):
+                print(f"[입력 오류] --pages {a.pages} 가 추출된 {len(sources)}장을 넘습니다.", file=sys.stderr)
+                return 2
+            sources = [sources[i - 1] for i in sel]
     else:
         print(f"[입력 오류] 지원하지 않는 형식입니다: {ext} (.pdf, 로컬 전용 .mov)", file=sys.stderr)
         return 2
@@ -117,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     images, spread_info = spread.expand_spreads(sources, work / "page_images", a.spread, a.gutter_offset, a.spread_overlap)
     n_split = sum(1 for s in spread_info if s["kind"] == "left")
     print(f"원본 {len(sources)}장 → 책 {len(images)}쪽 (펼침면 {n_split}장 분리, --spread {a.spread})")
+    pdf_map = sel if (pdf_for_text is not None and sel is not None) else None
     if pdf_for_text is not None and n_split:
         a.skip_ocr_if_text = False  # 분리된 쪽은 PDF 쪽 번호와 대응하지 않으므로 텍스트 레이어를 쓸 수 없다
     if a.max_pages:
@@ -124,18 +157,44 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- 2. OCR (Gemini) / 텍스트 레이어
     ocr = None
-    if s.api_key:
+    max_calls = 0
+    if a.ocr == "tesseract":
+        ocr = ocr_tesseract.make_tesseract_ocr("kor+eng")
+        print("tesseract(kor+eng) 사용: 호출 한도 없음")
+    elif s.api_key:
         from .ocr import make_gemini_ocr
         ocr = make_gemini_ocr(s.api_key, s.model, s.rpm)
         print(f"Gemini 사용: 모델 {s.model}, RPM {s.rpm}")
+        max_calls = a.max_calls or s.rpd
+        hint = pipeline.read_quota_hint(work)
+        if hint:
+            line = f"지난 실행 기록: {hint['at']} {ocr_kind_label(hint['kind'])} 도달 (그 전까지 성공 {hint['successful_calls']}회)."
+            if hint["kind"] == "daily" and hint["successful_calls"] and not max_calls:
+                line += f" 하루 한도 안에서 미리 멈추려면 --max-calls {hint['successful_calls']} (또는 GEMINI_RPD) 를 지정하세요."
+            elif hint["kind"] == "daily" and max_calls > hint["successful_calls"] > 0:
+                line += f" 지정한 상한({max_calls})이 기록({hint['successful_calls']})보다 큽니다."
+            print(line + " 일일 한도는 미국 태평양시 자정에 초기화(공식 문서 기준).")
     else:
         print("GEMINI_API_KEY 가 없습니다(.env 확인). 텍스트 레이어가 있는 PDF 페이지만 처리됩니다.")
     results, stopped = pipeline.process_pages(images, work, ocr, pdf=pdf_for_text, use_textlayer=a.skip_ocr_if_text,
-                                              max_calls=a.max_calls or s.rpd, rpm=s.rpm if ocr else 0.0)
+                                              max_calls=max_calls, rpm=s.rpm if (ocr and a.ocr == "gemini") else 0.0,
+                                              pdf_page_map=pdf_map)
     pending = len(images) - len(results)
 
     # ---- 3. 후처리
-    body, stats = postprocess.postprocess([namespaced_markdown(r) for r in results])
+    fig_map = build_figure_map(results)
+    toc_entries = None
+    if a.ocr == "tesseract":
+        opt = structure.EmbedOptions(a.embed_page_images, a.embed_min_chars, a.embed_min_ink)
+        mds, emb, toc_all, sstats = structure.assemble([r for r in results if r.get("engine") == "tesseract"], opt, work / "embed", a.heading_ratio)
+        fig_map.update(emb)
+        extra += ["## 책 조립(tesseract)", ""] + [f"- {k}: {v}" for k, v in sstats.items()]
+        page_mds = mds
+    else:
+        page_mds = [namespaced_markdown(r) for r in results]
+    body, stats = postprocess.postprocess(page_mds)
+    if a.ocr == "tesseract":
+        toc_entries = structure.match_toc_to_body(toc_all, body)
     (out / "전체원문.md").write_text(body, encoding="utf-8")
     md_dir = out / "pages_md"
     md_dir.mkdir(exist_ok=True)
@@ -143,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         (md_dir / f"p{r['page']:04d}.md").write_text(r.get("markdown", ""), encoding="utf-8")
 
     # ---- 4. 책 PDF
-    low = report.low_confidence_pages(results, a.threshold)
+    low = report.low_confidence_pages(results, a.threshold if a.threshold is not None else (0.6 if a.ocr == "tesseract" else 0.7))
     if stopped and not a.allow_partial:
         report.write_report(out / "리포트.md", results, low, stats, extra, spread_info, pending)
         print(f"[중단] 미처리 {pending}쪽이 남아 책 PDF 는 만들지 않았습니다(진행상황은 {work} 에 저장됨).\n"
@@ -154,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         report.write_report(out / "리포트.md", results, low, stats, extra, spread_info, pending)
         return 3
     title = a.title or inp.stem
-    html_str = render.build_html(body, build_figure_map(results), title, render.default_subtitle())
+    html_str = render.build_html(body, fig_map, title, render.default_subtitle(), toc_entries)
     pdf_path = out / a.name
     render.build_pdf(html_str, pdf_path, allowed_dirs=[work])
 
@@ -166,6 +225,11 @@ def main(argv: list[str] | None = None) -> int:
     for p in problems:
         print(f"[검증 경고] {p}")
     return 0 if not problems else 4
+
+
+def ocr_kind_label(kind: str) -> str:
+    from .ocr import KIND_LABEL
+    return KIND_LABEL.get(kind, kind)
 
 
 def _verify(pdf: Path, results: list[dict]) -> list[str]:

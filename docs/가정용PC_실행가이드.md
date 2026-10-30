@@ -114,3 +114,12 @@ python -m bookpdf 책영상.mov --out output
 - 실제 아이폰 영상으로는 아직 검증하지 못했습니다(합성 영상으로만 확인). 3쪽 시험에서 결과를 꼭 확인하세요.
 - 제본선이 심하게 휘거나 기울면 반대쪽 가장자리가 조금 섞일 수 있습니다(글자 잘림보다 섞임을 택한 설계).
 - 쪽번호 점검은 OCR이 번호를 읽어야 동작합니다. 번호가 없는 책이면 점검이 생략됩니다.
+
+## 🆕 Gemini 한도(429)에 막힐 때 → tesseract 로 전체 책
+```
+python -m bookpdf 책.pdf --ocr tesseract --dpi 300 --pages 114-215 --embed-page-images
+```
+- 한도 없음. 글자 인식은 Gemini보다 거칠 수 있어 `리포트.md` 의 신뢰도 낮은 쪽을 확인하세요(실제 책 품질은 미검증).
+- 차트 위주 쪽은 원본 이미지로 들어갑니다(`--embed-min-chars`/`--embed-min-ink` 로 기준 조정).
+- tesseract 설치는 README 의 'tesseract 모드' 참고(Windows/macOS 는 미검증).
+- Gemini 가 `일일 한도(RPD)` 로 멈추면 `--max-calls` 안내가 출력됩니다. 내일(미국 태평양시 자정 이후) 같은 명령으로 이어집니다.

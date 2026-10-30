@@ -25,20 +25,24 @@ def validate_pdf(path: Path) -> int:
     return n
 
 
-def render_pages(pdf: Path, out_dir: Path, dpi: int = 200) -> list[Path]:
-    """페이지별 PNG 렌더. 이미 있는 파일은 건너뛴다(재개용)."""
+def render_pages(pdf: Path, out_dir: Path, dpi: int = 200, pages: list[int] | None = None,
+                 max_side: int = MAX_SIDE) -> list[Path]:
+    """페이지별 PNG 렌더(파일명은 원본 PDF 쪽 번호). pages 가 있으면 그 쪽만. 이미 있는 파일은 건너뛴다(재개용)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     doc = fitz.open(pdf)
     paths: list[Path] = []
+    wanted = set(pages) if pages else None
     for i, page in enumerate(doc, start=1):
+        if wanted is not None and i not in wanted:
+            continue
         p = out_dir / f"p{i:04d}.png"
         paths.append(p)
         if p.exists():
             continue
         scale = dpi / 72
         longest = max(page.rect.width, page.rect.height) * scale
-        if longest > MAX_SIDE:
-            scale *= MAX_SIDE / longest
+        if longest > max_side:
+            scale *= max_side / longest
         page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).save(p)
     doc.close()
     return paths
