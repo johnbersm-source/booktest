@@ -8,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import glyphs, pagesel, pdf_input, pipeline, postprocess, render, report, spread, structure
+from . import glyphs, pagesel, pdf_input, pipeline, postprocess, render, report, spread, spread_report, structure
 from .config import load_settings
 
 
@@ -27,6 +27,9 @@ def build_figure_map(results: list[dict]) -> dict[str, dict]:
 
 def namespaced_markdown(r: dict) -> str:
     return re.sub(r"\{\{FIG:(\d+)\}\}", lambda m: "{{FIG:p%d_%s}}" % (r["page"], m.group(1)), r.get("markdown", ""))
+
+
+SRC_KEYS = ("input", "size", "mtime", "pages", "dpi", "fps", "page_thr", "max_frame_side")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="[.mov 로컬 전용] 페이지 구분 민감도(0~1). 같은 페이지가 쪼개지면 올리고, 다른 페이지가 합쳐지면 내리세요")
     ap.add_argument("--spread", choices=["auto", "on", "off"], default="auto",
                     help="펼침면(좌/우 두 쪽이 한 장) 분리: auto=가로세로비+제본선 자동 판별(기본), on=모두 분리, off=분리 안 함")
+    ap.add_argument("--spread-thr", type=float, default=spread.DEFAULT_THR,
+                    help="펼침면 판정 임계값(0~1, 기본 0.5). 프레임별 점수가 이 값 이상이면 분리. 두 쪽이 한 장으로 남으면 낮추고(0.4, 0.3), 단일 쪽이 잘리면 올리세요")
+    ap.add_argument("--split-only", action="store_true",
+                    help="OCR·책 PDF 없이 펼침면 분리와 쪽 이미지 저장만 수행하고, 프레임별 판정 로그·미리보기·분리점검.md 를 만든다(API 키·tesseract 불필요)")
     ap.add_argument("--gutter-offset", type=float, default=0.0,
                     help="제본선 위치 수동 보정(이미지 폭 비율, 예: 0.02=오른쪽으로 2%%, -0.02=왼쪽으로 2%%)")
     ap.add_argument("--spread-overlap", type=float, default=0.015,
@@ -74,7 +81,10 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             print(f"[입력 오류] {e}", file=sys.stderr)
             return 2
-    if a.ocr == "tesseract":
+    if not 0.0 <= a.spread_thr <= 1.0:
+        print(f"[입력 오류] --spread-thr 는 0~1 사이여야 합니다(입력: {a.spread_thr}).", file=sys.stderr)
+        return 2
+    if a.ocr == "tesseract" and not a.split_only:
         from . import ocr_tesseract
         msg = ocr_tesseract.check_available("kor+eng")
         if msg:
@@ -92,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     sig = {"input": inp.name, "size": inp.stat().st_size if inp.is_file() else None,
            "mtime": inp.stat().st_mtime_ns if inp.is_file() else None,
            "spread": a.spread, "gutter_offset": a.gutter_offset, "spread_overlap": a.spread_overlap,
+           "spread_thr": a.spread_thr, "spread_algo": spread.ALGO_VERSION,
            "ocr": a.ocr, "pages": a.pages, "dpi": a.dpi, "fps": a.fps, "page_thr": a.page_thr, "max_frame_side": a.max_frame_side}
     meta_path = work / "meta.json"
     if a.restart and work.exists():
@@ -99,14 +110,21 @@ def main(argv: list[str] | None = None) -> int:
         work.mkdir(parents=True, exist_ok=True)
     if meta_path.exists():
         old = json.loads(meta_path.read_text(encoding="utf-8"))
-        if old != sig:
-            diff = sorted(k for k in sig if old.get(k) != sig[k])
+        # --split-only 는 원본 이미지(입력·dpi·fps 등)만 이전 결과와 맞으면 된다: 분리·OCR 설정은 별도 폴더에 쓰므로 자유롭게 바꿔 시험할 수 있다.
+        keys = SRC_KEYS if (a.split_only or old.get("_partial")) else tuple(sig)
+        diff = sorted(k for k in keys if old.get(k) != sig[k])
+        if diff:
             print(f"[설정 불일치] 이전 실행과 달라진 항목: {', '.join(diff)}\n"
-                  f"  이전 결과와 섞이지 않도록 중단합니다. 처음부터 하려면 --restart, 새 폴더를 쓰려면 --work 를 지정하세요.",
+                  f"  이전 결과와 섞이지 않도록 중단합니다. 처음부터 하려면 --restart, 새 폴더를 쓰려면 --work 를 지정하세요."
+                  + ("\n  (spread_algo/spread_thr 는 이 버전에서 펼침면 판정 방식이 바뀌어 새로 생긴 항목입니다. 이전 판정으로 만든 쪽 이미지·OCR 결과와 섞지 않으려는 것이니 --restart 를 쓰세요.)"
+                     if {"spread_algo", "spread_thr"} & set(diff) else ""),
                   file=sys.stderr)
             return 2
+        if old.get("_partial") and not a.split_only:
+            meta_path.write_text(json.dumps(sig, ensure_ascii=False, indent=1), encoding="utf-8")
     else:
-        meta_path.write_text(json.dumps(sig, ensure_ascii=False, indent=1), encoding="utf-8")
+        meta_path.write_text(json.dumps({**sig, **({"_partial": True} if a.split_only else {})}, ensure_ascii=False, indent=1),
+                             encoding="utf-8")
 
     # ---- 1. 입력 검증 + 원본 이미지 만들기
     ext = inp.suffix.lower()
@@ -146,9 +164,25 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # ---- 1b. 펼침면 분리 (단일 쪽 이미지는 그대로 통과)
-    images, spread_info = spread.expand_spreads(sources, work / "page_images", a.spread, a.gutter_offset, a.spread_overlap)
+    # --split-only 는 work/split_only 에 따로 쓴다(매번 새로 만듦): 임계값을 바꿔 반복 시험해도 본 실행의 쪽 이미지·OCR 결과를 건드리지 않는다.
+    split_dir = work / "split_only" if a.split_only else work
+    if a.split_only and split_dir.exists():
+        shutil.rmtree(split_dir)
+    images, spread_info, frames = spread.expand_spreads_ex(
+        sources, split_dir / "page_images", a.spread, a.gutter_offset, a.spread_overlap, thr=a.spread_thr, verbose=a.split_only)
     n_split = sum(1 for s in spread_info if s["kind"] == "left")
-    print(f"원본 {len(sources)}장 → 책 {len(images)}쪽 (펼침면 {n_split}장 분리, --spread {a.spread})")
+    print(f"원본 {len(sources)}장 → 책 {len(images)}쪽 (펼침면 {n_split}장 분리, --spread {a.spread}, --spread-thr {a.spread_thr})")
+    spread_notes = spread_report.summary_lines(frames, a.spread_thr, a.spread)
+    if a.split_only:
+        sheets = spread_report.contact_sheets(frames, sources, split_dir / "preview", a.spread_thr)
+        chk = out / "분리점검.md"
+        spread_report.write_check_md(chk, frames, a.spread_thr, a.spread, sheets, split_dir / "page_images",
+                                     split_dir / "page_images" / "spread_log.csv", len(images))
+        print(f"[분리만] 쪽 이미지 {split_dir / 'page_images'} / 판정 로그 {split_dir / 'page_images' / 'spread_log.csv'} / "
+              f"미리보기 {len(sheets)}장 {split_dir / 'preview'} / 점검 문서 {chk}")
+        return 0
+    print("\n".join(l for l in spread_notes if l.startswith("-") or l.startswith("###"))[:1500])
+    extra += spread_notes
     pdf_map = sel if (pdf_for_text is not None and sel is not None) else None
     if pdf_for_text is not None and n_split:
         a.skip_ocr_if_text = False  # 분리된 쪽은 PDF 쪽 번호와 대응하지 않으므로 텍스트 레이어를 쓸 수 없다
@@ -159,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     ocr = None
     max_calls = 0
     if a.ocr == "tesseract":
+        from . import ocr_tesseract
         ocr = ocr_tesseract.make_tesseract_ocr("kor+eng")
         print("tesseract(kor+eng) 사용: 호출 한도 없음")
     elif s.api_key:

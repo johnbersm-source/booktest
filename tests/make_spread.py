@@ -63,3 +63,37 @@ def count_color(img: Image.Image, color: str) -> int:
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
     m = (r > 120) & (g < 90) & (b < 90) if color == "red" else (b > 120) & (r < 90) & (g < 90)
     return int(m.sum())
+
+
+DESK = (96, 78, 62)
+
+
+def to_portrait_frame(spread: Image.Image, fw: int = 1080, fh: int = 1920, cx: float = 0.5, scale: float = 0.96,
+                      cy: float = 0.5) -> Image.Image:
+    """펼침면을 책상 위에 놓인 모양으로 세로 프레임(아이폰 세로 영상 프레임)에 넣는다. cx: 책 중심의 가로 위치."""
+    s = fw * scale / spread.width
+    sp = spread.resize((int(spread.width * s), int(spread.height * s)), Image.LANCZOS)
+    fr = Image.new("RGB", (fw, fh), DESK)
+    fr.paste(sp, (int(fw * cx - sp.width / 2), int(fh * cy - sp.height / 2)))
+    return fr
+
+
+def make_chart_spread(seed: int = 1, shadow: bool = True, w: int = 700, h: int = 1000, shadow_amp: float = 0.28) -> Image.Image:
+    """제본선을 가로지르는 큰 차트(막대+선) 쪽. 가운데에 글자 없는 띠가 없어 띠 기반 판정이 실패하는 경우."""
+    base, _ = make_spread(seed=seed, gutter_shadow=False, w=w, h=h)
+    d = ImageDraw.Draw(base)
+    d.rectangle([60, 200, 2 * w - 60, h - 200], fill=(250, 248, 240))
+    rnd = random.Random(seed)
+    n = 14
+    bw = (2 * w - 160) // n
+    for i in range(n):
+        top = h - 260 - rnd.randint(80, 480)
+        d.rectangle([80 + i * bw, top, 80 + i * bw + bw - 10, h - 260], fill=(60, 90, 170))
+    pts = [(80 + i * bw + bw // 2, h - 260 - rnd.randint(150, 500)) for i in range(n)]
+    d.line(pts, fill=(200, 60, 40), width=6)
+    d.rectangle([60, 200, 2 * w - 60, h - 200], outline=(30, 30, 30), width=4)
+    arr = np.asarray(base).astype(np.float32)
+    if shadow:
+        xs = np.arange(2 * w)
+        arr = arr * (1 - shadow_amp * np.exp(-((xs - w) ** 2) / (2 * 22 ** 2)))[None, :, None]
+    return Image.fromarray(arr.clip(0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(0.6))

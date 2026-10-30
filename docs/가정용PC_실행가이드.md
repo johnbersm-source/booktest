@@ -97,7 +97,7 @@ python -m bookpdf 책영상.mov --out output
 
 | 상황 | 옵션 |
 |---|---|
-| 펼침면이 안 갈라짐 / 단일 쪽을 갈라버림 | `--spread on` / `--spread off` |
+| 펼침면이 안 갈라짐 / 단일 쪽을 갈라버림 | 먼저 `--split-only` 로 분리만 시험(아래) → `--spread-thr` 를 낮춤(0.4, 0.3) / 올림(0.6). 그래도 안 되면 `--spread on` / `--spread off` |
 | 갈라진 선이 살짝 어긋남 | `--gutter-offset 0.02` (오른쪽 2%) / `-0.02` |
 | 쪽이 빠짐(빨리 넘긴 영상) | `--fps 5` |
 | 같은 쪽이 둘로 쪼개짐 | `--page-thr 0.15` (올리기) |
@@ -123,3 +123,22 @@ python -m bookpdf 책.pdf --ocr tesseract --dpi 300 --pages 114-215 --embed-page
 - 차트 위주 쪽은 원본 이미지로 들어갑니다(`--embed-min-chars`/`--embed-min-ink` 로 기준 조정).
 - tesseract 설치는 README 의 'tesseract 모드' 참고(Windows/macOS 는 미검증).
 - Gemini 가 `일일 한도(RPD)` 로 멈추면 `--max-calls` 안내가 출력됩니다. 내일(미국 태평양시 자정 이후) 같은 명령으로 이어집니다.
+
+## 펼침면이 제대로 갈렸는지 먼저 확인하기 (`--split-only`)
+
+OCR 전에 분리만 시험할 수 있습니다. API 키·tesseract 가 없어도 됩니다.
+
+```
+python -m bookpdf IMG_5899_chart.pdf --out output --split-only
+```
+
+1. `output/분리점검.md` 를 열어 요약(원본 N장 중 K장 분리)과 점검 대상 프레임 목록을 봅니다.
+2. `output/work/split_only/preview/preview_01.jpg` … 에서 프레임을 눈으로 확인합니다(빨강=분리선, 주황=주변 프레임 기준으로 분리, 회색 점선=단일로 판정했지만 제본선 후보가 있던 위치, `*`=경계).
+3. 프레임별 점수·사유는 `output/work/split_only/page_images/spread_log.csv` (엑셀). 두 쪽이 한 장으로 남은 프레임의 점수를 보고 `--spread-thr` 를 그 아래로 내립니다.
+4. `--spread-thr 0.4 --split-only` 처럼 값을 바꿔 다시 실행하면 `split_only` 폴더만 새로 만들어집니다(본 실행 결과는 그대로).
+5. 만족하면 `--split-only` 를 뺀 같은 명령으로 실행합니다. 이전 판정으로 만든 `work` 가 있으면 `--restart` 가 필요합니다(판정 방식이 바뀐 버전이라 설정 불일치로 멈춥니다).
+
+쪽번호가 256→258→260→263 처럼 건너뛰면 `리포트.md` 의 쪽번호 점검이 원인을 나눠 보여줍니다.
+- **분리 실패 의심**: 그 구간의 이미지가 단일로 처리됐는데 제본 띠/그림자 증거가 있거나 가로 이미지 → 한 이미지에 두 쪽이 들어 있을 가능성. `--spread-thr` 를 낮추세요.
+- **촬영 누락 의심**: 분리 실패로 설명되지 않는 건너뜀 → 영상에서 쪽을 놓쳤을 가능성. `--fps` 를 올리거나 쪽을 천천히 넘겨 다시 찍으세요.
+(추정입니다. 번호 인식 오류가 끼면 틀릴 수 있으니 `work/page_images/` 이미지를 직접 확인하세요.)
