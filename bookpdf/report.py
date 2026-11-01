@@ -30,6 +30,8 @@ def low_confidence_pages(results: list[dict], threshold: float = 0.7) -> list[di
     return out
 
 
+OFFSET_TOL = 15           # (번호-순번) 이 가장 흔한 값에서 이만큼 넘게 벗어난 번호 후보는 오인식으로 보고 무시
+MAX_LISTED = 8            # 누락 번호 나열 상한(나머지는 '…')
 SUSPECT_EVIDENCE = 0.25   # 단일로 판정됐어도 제본 띠/그림자 증거가 이 이상이면 '펼침면일 수 있음'
 SUSPECT_ASPECT = 1.10     # 또는 가로 이미지(가로/세로 ≥ 이 값)
 
@@ -61,10 +63,16 @@ def check_page_numbers(results: list[dict], spreads: list[dict] | None = None) -
     """
     seq = [(r["page"], r.get("page_number")) for r in results if r.get("page_number") is not None]
     out: dict = {"detected": len(seq), "total": len(results), "missing": [], "duplicates": [], "reversed": [],
-                 "offset": None, "usable": len(seq) >= 3}
+                 "offset": None, "usable": len(seq) >= 3, "rejected": []}
     if not out["usable"]:
         return out
     out["offset"] = Counter(n - p for p, n in seq).most_common(1)[0][0]  # 가장 흔한 (번호 - 순번)
+    # 차트 축 숫자 등 쪽번호가 아닌 값이 섞이면 점검이 엉뚱한 경고를 쏟는다: 주된 흐름(번호-순번)에서 크게 벗어난 후보는 버린다.
+    out["rejected"] = [(p, n) for p, n in seq if abs(n - p - out["offset"]) > OFFSET_TOL]
+    seq = [(p, n) for p, n in seq if abs(n - p - out["offset"]) <= OFFSET_TOL]
+    out["usable"] = len(seq) >= 3
+    if not out["usable"]:
+        return out
     suspects = split_suspects(spreads)
     for (pa, na), (pb, nb) in zip(seq, seq[1:]):
         di, dn = pb - pa, nb - na
@@ -91,15 +99,22 @@ def check_page_numbers(results: list[dict], spreads: list[dict] | None = None) -
 def format_page_number_report(chk: dict) -> list[str]:
     lines = ["", "## 쪽번호 점검", ""]
     if not chk["usable"]:
-        lines.append(f"- 쪽번호를 읽은 쪽이 {chk['detected']}/{chk['total']}개뿐이라 점검하지 못했습니다.")
+        lines.append(f"- 쪽번호를 읽은 쪽이 {chk['detected']}/{chk['total']}개뿐이라 점검하지 못했습니다."
+                     + (f" (주된 흐름에서 벗어나 무시한 후보 {len(chk['rejected'])}개 포함)" if chk.get("rejected") else ""))
         return lines
     lines.append(f"- 쪽번호를 읽은 쪽: {chk['detected']}/{chk['total']}  (가장 흔한 번호-순번 차이: {chk['offset']})")
+    if chk.get("rejected"):
+        rj = chk["rejected"]
+        lines.append(f"- 주된 흐름(번호-순번 ≈ {chk['offset']}, ±{OFFSET_TOL})에서 벗어나 **무시한 번호 후보 {len(rj)}개**: "
+                     + ", ".join(f"p{p}={n}" for p, n in rj[:MAX_LISTED]) + (" …" if len(rj) > MAX_LISTED else "")
+                     + " (차트 축 숫자 등 쪽번호가 아닌 값일 가능성)")
     if not (chk["missing"] or chk["duplicates"] or chk["reversed"]):
         lines.append("- 번호가 이어지는 구간에서 누락·중복·역행은 발견되지 않았습니다.")
         return lines
     for m in chk["missing"]:
         a, b = m["between_pages"]
-        nums = ", ".join(map(str, m["missing_numbers"])) or "?"
+        mn = m["missing_numbers"]
+        nums = (", ".join(map(str, mn[:MAX_LISTED])) + (f" … 외 {len(mn) - MAX_LISTED}개" if len(mn) > MAX_LISTED else "")) or "?"
         head = f"p{a}(번호 {m['numbers'][0]}) → p{b}(번호 {m['numbers'][1]})"
         if not m.get("classified"):
             lines.append(f"- **누락 의심**: {head} 사이에 {m['count']}쪽 빠짐 (번호 {nums})")

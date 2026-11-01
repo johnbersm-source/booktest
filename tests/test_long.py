@@ -265,3 +265,21 @@ def test_long_video_30_pages_streaming_and_resume(tmp_path, monkeypatch):
         g = cv2.cvtColor(cv2.imread(str(out[k])), cv2.COLOR_BGR2GRAY)
         diffs = [video_input.page_diff(video_input._small(g), video_input._small(cv2.cvtColor(p, cv2.COLOR_BGR2GRAY))) for p in pages]
         assert int(np.argmin(diffs)) == k, f"쪽 {k + 1} 순서/내용 불일치"
+
+
+def test_page_number_outliers_from_charts_are_ignored():
+    """차트 축 숫자 등 엉뚱한 값(0, 7, 41, 200)이 섞여도 주된 흐름(번호-순번≈245)만으로 점검하고 무시한 후보를 알린다."""
+    nums = {168: 413, 169: 200, 170: 415, 171: 7, 172: 417, 175: 420, 176: 0, 178: 423, 180: 425}
+    res = [{"page": p, "page_number": n, "markdown": "x", "confidence": 0.9} for p, n in nums.items()]
+    chk = report.check_page_numbers(res)
+    assert sorted(p for p, _ in chk["rejected"]) == [169, 171, 176] and chk["offset"] == 245
+    assert not chk["missing"] and not chk["reversed"]
+    txt = "\n".join(report.format_page_number_report(chk))
+    assert "무시한 번호 후보 3개" in txt and "p169=200" in txt
+
+
+def test_page_number_missing_list_is_capped():
+    res = [{"page": p, "page_number": n, "markdown": "x", "confidence": 0.9} for p, n in
+           [(1, 1), (2, 2), (3, 3), (4, 4), (5, 14)]]
+    txt = "\n".join(report.format_page_number_report(report.check_page_numbers(res)))
+    assert "외 " in txt and txt.count(",") < 40
