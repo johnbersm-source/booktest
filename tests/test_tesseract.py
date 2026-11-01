@@ -25,6 +25,34 @@ def test_parse_pages():
         pagesel.parse_pages("1-300", total=215)
 
 
+def _ln(text, y0, h=30, block=1, par=1):
+    return {"text": text, "x0": 900, "x1": 1100, "y0": y0, "y1": y0 + h, "h": h, "conf": 80.0, "chars": len(text),
+            "block": block, "par": par}
+
+
+def test_page_number_found_above_footer_zone():
+    # p6 실측: 쪽번호가 높이 2025 의 87.9%(y=1779) 에 있고 같은 줄에 그림 잡음이 붙음 → 바닥글 구역(아래 9%) 밖
+    lines = [_ln("본문 첫 줄", 300), _ln("~ 9 1 tie ee AES 259", 1779, block=2)]
+    blocks, no = ocr_tesseract.build_blocks(lines, 2025)
+    assert no == 259
+    assert len(blocks) == 2                      # 줄은 본문에서 빼지 않는다
+
+
+def test_low_line_number_needs_to_be_the_lowest_line_and_low_enough():
+    # 맨 아래 줄이 아니면(그 아래에 다른 글이 있음) 차트 축 숫자일 수 있으므로 채택하지 않는다
+    lines = [_ln("250", 1700, block=2), _ln("그림 설명 문장", 1900, block=3)]
+    assert ocr_tesseract.build_blocks(lines, 2025)[1] is None
+    # 80% 보다 위면 채택하지 않는다
+    assert ocr_tesseract.build_blocks([_ln("259", 1500)], 2025)[1] is None
+    # 숫자가 없는 맨 아래 줄은 None
+    assert ocr_tesseract.build_blocks([_ln("끝", 1800)], 2025)[1] is None
+
+
+def test_footer_zone_page_number_still_removed_from_body():
+    blocks, no = ocr_tesseract.build_blocks([_ln("본문", 300), _ln("42", 1900, block=2)], 2025)
+    assert no == 42 and [b["text"] for b in blocks] == ["본문"]
+
+
 class E(Exception):
     def __init__(self, msg, code=429):
         super().__init__(msg)

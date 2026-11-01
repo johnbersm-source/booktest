@@ -16,7 +16,8 @@ from typing import Callable
 from PIL import Image
 
 EDGE_FRAC = 0.09          # 쪽 위/아래 이 비율 안쪽은 머리글/바닥글 후보 구역
-MIN_WORD_CONF = 40        # 글자 수 집계에 포함할 단어 신뢰도(0~100)
+LOW_LINE_FRAC = 0.80      # 쪽번호 후보 탐색용: 가장 아래 줄이 이 비율보다 아래면 검사(구역 판정과는 별개)
+MIN_WORD_CONF = 40       # 글자 수 집계에 포함할 단어 신뢰도(0~100)
 _DIGITS_ONLY = re.compile(r"^\W*(\d{1,4})\W*$")
 _EDGE_NUM = re.compile(r"^(\d{1,4})\s+\S|\S\s+(\d{1,4})$")
 
@@ -126,7 +127,24 @@ def build_blocks(lines: list[dict], page_h: int) -> tuple[list[dict], int | None
         })
     if page_no is None and edge_hint is not None and 0 < edge_hint < 10000:
         page_no = edge_hint
+    if page_no is None and lines:
+        page_no = _low_line_number(lines, page_h)
     return blocks, page_no
+
+
+def _low_line_number(lines: list[dict], page_h: int) -> int | None:
+    """바닥글 구역(아래 9%) 밖이라도, 쪽에서 가장 아래 줄이 쪽 높이의 80% 아래에 있고 숫자만이거나
+    줄 끝이 숫자면 쪽번호 후보로 본다. 줄은 본문에서 빼지 않는다(그림·차트 축 숫자일 수 있으므로 기록만 함).
+    잘못 읽힌 값은 리포트의 쪽번호 점검이 주된 흐름과 비교해 걸러낸다."""
+    last = max(lines, key=lambda l: l["y1"])
+    if last["y0"] <= page_h * LOW_LINE_FRAC:
+        return None
+    text = last["text"].strip()
+    m = _DIGITS_ONLY.match(text) or _EDGE_NUM.search(text)
+    if not m:
+        return None
+    n = int(next(g for g in m.groups() if g))
+    return n if 0 < n < 10000 else None
 
 
 def ink_ratio(image_path: Path) -> float:
