@@ -223,7 +223,14 @@ def main(argv: list[str] | None = None) -> int:
         opt = structure.EmbedOptions(a.embed_page_images, a.embed_min_chars, a.embed_min_ink)
         mds, emb, toc_all, sstats = structure.assemble([r for r in results if r.get("engine") == "tesseract"], opt, work / "embed", a.heading_ratio)
         fig_map.update(emb)
+        embedded = [r["page"] for r in results if f"full{r['page']}" in emb]
+        for r in results:
+            r["embedded"] = r["page"] in embedded       # 원본 이미지로 넣은 쪽: 글자 인식 신뢰도는 의미가 없으므로 점검 대상에서 제외
         extra += ["## 책 조립(tesseract)", ""] + [f"- {k}: {v}" for k, v in sstats.items()]
+        if embedded:
+            extra += [f"- 원본 쪽 이미지로 삽입한 쪽({len(embedded)}개, 신뢰도 점검 제외): " + ", ".join(f"p{p}" for p in embedded[:60])
+                      + (" …" if len(embedded) > 60 else ""),
+                      "  (글자 위주인데 그림으로 들어갔다면 `--embed-min-chars` 를 낮추고, 그림인데 글자로 나왔다면 `--embed-min-ink` 를 낮추세요)"]
         page_mds = mds
         md_pages = [r["page"] for r in results if r.get("engine") == "tesseract"]
     else:

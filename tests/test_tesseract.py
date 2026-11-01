@@ -232,3 +232,11 @@ def test_cli_prints_max_calls_hint(scan_pdf, tmp_path, monkeypatch, capsys):
     assert rc == 5 and "일일 한도(RPD)" in txt and "--max-calls 7" in txt and "태평양" in txt
     rc = run([scan_pdf, "--pages", "1-2", "--dpi", "100", "--max-calls", "5", "--out", out])
     assert seen["max_calls"] == 5          # 사용자가 준 상한이 그대로 전달된다
+
+
+def test_embedded_pages_are_excluded_from_low_confidence():
+    from bookpdf import report
+    res = [{"page": 1, "markdown": "", "confidence": 0.0, "embedded": True},
+           {"page": 2, "markdown": "", "confidence": 0.0},
+           {"page": 3, "markdown": "본문 가나다라마바사", "confidence": 0.4, "embedded": False}]
+    assert [x["page"] for x in report.low_confidence_pages(res, 0.6)] == [2, 3]

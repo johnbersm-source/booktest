@@ -11,6 +11,8 @@ def low_confidence_pages(results: list[dict], threshold: float = 0.7) -> list[di
     for r in results:
         reasons = []
         text = r.get("markdown", "")
+        if r.get("embedded") and not r.get("error"):
+            continue            # 원본 이미지로 삽입한 쪽(tesseract --embed-page-images)
         if r.get("error"):
             reasons.append(f"처리 실패: {r['error'][:120]}")
         elif not text.strip():
