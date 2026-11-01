@@ -47,7 +47,7 @@ def summary_lines(frames: list[dict], thr: float, mode: str, limit: int = 15) ->
              "- 프레임별 점수·사유는 `page_images/spread_log.csv` (엑셀에서 열림)"]
     c = classify(frames, thr, mode)
     for key, title, hint in (
-        ("prior", "책 전체의 제본선 위치를 기준으로 분리한 프레임 (자체 증거가 약했음)", "잘못 잘렸다면 `--spread-thr` 를 올리거나 해당 프레임을 확인"),
+        ("prior", "책 전체의 제본선 위치를 적용한 프레임 (증거가 약해 분리했거나 위치를 보정함)", "잘못 잘렸다면 미리보기에서 해당 프레임을 확인하고 `--spread-thr` 를 올리거나 `--gutter-offset` 으로 보정"),
         ("border", f"경계 프레임 (점수가 임계값 ±{UNCERTAIN_BAND} 이내)", "`--spread-thr` 를 조금 바꾸면 판정이 뒤집힙니다"),
         ("maybe_missed", "단일로 판정했지만 제본 띠/그림자 증거가 있는 프레임", "두 쪽이 들어 있다면 `--spread-thr` 를 낮추세요"),
     ):
@@ -56,6 +56,10 @@ def summary_lines(frames: list[dict], thr: float, mode: str, limit: int = 15) ->
             lines += [f"  - {_fmt(f)} → {'분리' if f['decision'] == 'split' else '단일'}" for f in c[key][:limit]]
             if len(c[key]) > limit:
                 lines.append(f"  - … 외 {len(c[key]) - limit}장 (CSV 참고)")
+    singles = [f for f in frames if f["decision"] == "single"]
+    if mode == "auto" and 0 < len(singles) <= 40:
+        lines += ["", f"### 단일로 남긴 프레임 전체: {len(singles)}장", "- 표지·전면 그림 같은 진짜 단일 쪽인지, 두 쪽이 남은 것인지 미리보기에서 확인하세요"]
+        lines += [f"  - {_fmt(f)}" for f in singles]
     return lines + [""]
 
 

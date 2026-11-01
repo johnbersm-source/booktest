@@ -29,6 +29,9 @@ WORK_W = 900             # 분석용 축소 폭
 DEFAULT_THR = 0.5        # --spread-thr 기본값
 LEGACY_FLOOR = 0.55      # 가로 이미지 + 띠(≥2%)를 찾으면 최소 이 점수(이전 버전과 같은 판정 보장)
 STRONG = 0.65            # prior(책 전체 제본선 위치) 를 만들 때 쓰는 '확실한 프레임'의 최소 점수
+MIN_PRIOR_DENSITY = 0.4  # prior 로 띠 증거를 인정하려면 글자 밀도가 확실한 프레임 중앙값의 이 비율 이상이어야 함
+SNAP_BELOW = 0.80        # 이 점수 미만(증거가 약함)이면서
+SNAP_DIST = 0.02         # 책 전체 제본선 위치에서 이만큼(폭 비율) 벗어났으면 위치를 책 전체 값으로 보정
 UNCERTAIN_BAND = 0.10    # 점수가 임계값 ±이 안이면 경계 프레임으로 표시
 
 
@@ -53,7 +56,8 @@ class Analysis:
     score: float = 0.0
     decision: bool = False
     reason: str = ""
-    prior: bool = False            # 주변 프레임의 제본선 위치로 분리했는지
+    prior: bool = False            # 책 전체 제본선 위치를 적용했는지(약한 증거 분리 또는 위치 보정)
+    density: float = 0.0           # 글자 획 밀도(75퍼센타일). 거의 빈 쪽을 걸러내는 데 쓴다
     mass: np.ndarray | None = field(default=None, repr=False)     # 열별 글자 획 밀도(전체 높이)
     bright: np.ndarray | None = field(default=None, repr=False)   # 위/중간/아래 3구간의 열별 배경 밝기 프로필 (3, W)
 
@@ -243,8 +247,9 @@ def analyze(img: Image.Image) -> Analysis:
     third = (bot - top) // 3
     bright = np.stack([_smooth(_bg_profile(g[top + k * third: top + (k + 1) * third]), int(g.shape[1] * 0.01))
                        for k in range(3)]).astype(np.float32)
+    density = float(np.percentile(_smooth(mass, int(mass.shape[0] * 0.012)), 75))
     return Analysis(aspect=aspect, gutter=gut, side=side, gap_e=gap_e, shadow_e=shadow_e, side_e=side_e,
-                    score=float(score), mass=mass, bright=bright)
+                    score=float(score), mass=mass, bright=bright, density=density)
 
 
 def _local_evidence(a: Analysis, x: float) -> tuple[float, float, float]:
@@ -273,25 +278,35 @@ def decide(items: list[Analysis], mode: str = "auto", thr: float = DEFAULT_THR, 
         else:
             a.decision = False
             a.reason = f"점수 {a.score:.2f} < 임계 {thr:.2f}" + ("" if a.evidence >= 0.25 else " (제본 증거 없음)")
-    stat = {"prior_x": None, "prior_n": 0, "promoted": 0}
+    stat = {"prior_x": None, "prior_n": 0, "promoted": 0, "snapped": 0}
     if mode == "auto" and use_prior:
         strong = [a for a in items if a.decision and a.score >= max(thr, STRONG)]
         if len(strong) >= 3 and len(strong) / len(items) >= 0.25:
             px = float(np.median([a.gutter.x for a in strong]))
             pmin = float(np.median([a.gutter.x_min for a in strong]))
             pmax = float(np.median([a.gutter.x_max for a in strong]))
+            dmin = MIN_PRIOR_DENSITY * float(np.median([a.density for a in strong]))
             stat.update(prior_x=px, prior_n=len(strong))
             for a in items:
-                if a.decision:
-                    continue
                 blank, depth, side_e = _local_evidence(a, px)
-                if (blank <= 0.35 or depth >= 0.03) and side_e >= 0.5:
-                    a.decision, a.prior = True, True
-                    a.gutter = Gutter(px, pmin, pmax, a.gutter.gap, False, max(a.gutter.shadow, depth))
-                    why = "띠" if blank <= 0.35 else "그림자"
-                    a.reason = (f"점수 {a.score:.2f} < 임계 {thr:.2f} 이지만 확실한 {len(strong)}장의 제본선 위치"
-                                f"(x={px:.3f})에서 {why} 확인 → 분리")
-                    stat["promoted"] += 1
+                has_band = blank <= 0.35 and a.density >= dmin     # 글자가 거의 없는 쪽은 '가운데가 빈' 것이 당연하므로 띠 증거로 치지 않는다
+                if not a.decision:
+                    if (has_band or depth >= 0.03) and side_e >= 0.5:
+                        a.decision, a.prior = True, True
+                        a.gutter = Gutter(px, pmin, pmax, a.gutter.gap, False, max(a.gutter.shadow, depth))
+                        why = "띠" if has_band else "그림자"
+                        a.reason = (f"점수 {a.score:.2f} < 임계 {thr:.2f} 이지만 확실한 {len(strong)}장의 제본선 위치"
+                                    f"(x={px:.3f})에서 {why} 확인 → 분리")
+                        stat["promoted"] += 1
+                elif (a.score < SNAP_BELOW and abs(a.gutter.x - px) > SNAP_DIST and depth >= 0.03
+                      and depth > _local_evidence(a, a.gutter.x)[1]):
+                    # 증거가 약한 프레임의 제본선이 책 전체 위치에서 벗어나 있고, 책 전체 위치의 그림자 골짜기가 이 프레임이
+                    # 검출한 위치의 것보다 뚜렷하면 위치만 보정(카메라 고정 가정). 띠 증거는 차트처럼 글자 적은 쪽에서 쉽게 성립하므로 쓰지 않는다.
+                    old_x = a.gutter.x
+                    a.prior = True
+                    a.gutter = Gutter(px, pmin, pmax, a.gutter.gap, a.gutter.found, a.gutter.shadow)
+                    a.reason += f" | 제본선 x={old_x:.3f} → 책 전체 위치 {px:.3f} 로 보정"
+                    stat["snapped"] += 1
     return stat
 
 
@@ -389,13 +404,16 @@ def expand_spreads_ex(images: list[Path], out_dir: Path, mode: str = "auto", off
                     part.save(dst, quality=95) if p.suffix.lower() in (".jpg", ".jpeg") else part.save(dst)
                 pages.append(dst)
                 infos.append({"page": n, "source": src_idx, "kind": side, "gutter": asdict(a.gutter), **extra})
-            if not a.gutter.found and not a.prior:
-                log(f"  [경고] 원본 {src_idx}번: 제본선(글자 없는 띠)을 못 찾아 그림자/중앙 기준으로 분할 — --gutter-offset 으로 보정하세요")
+    weak = [i for i, a in enumerate(analyses, start=1)
+            if a is not None and a.decision and not a.prior and not a.gutter.found and a.gutter.shadow < 0.03]
+    if weak:   # 띠도 그림자도 못 찾고 중앙/추정 위치로 자른 프레임만 경고(그림자로 정상 분리한 프레임은 제외)
+        log(f"  [경고] 제본 띠·그림자를 모두 못 찾고 추정 위치로 분할한 원본 {len(weak)}장: "
+            f"{', '.join(map(str, weak[:20]))}{' …' if len(weak) > 20 else ''} — --gutter-offset 으로 보정하거나 미리보기를 확인하세요")
     (out_dir / "spreads.json").write_text(json.dumps(infos, ensure_ascii=False, indent=1), encoding="utf-8")
     write_csv(out_dir / "spread_log.csv", frames)
     if stat.get("prior_x") is not None:
         log(f"  책 전체 제본선 위치(확실한 {stat['prior_n']}장 기준): x={stat['prior_x']:.3f}, "
-            f"증거가 약해 이 위치로 분리한 프레임 {stat['promoted']}장")
+            f"증거가 약해 이 위치로 분리한 프레임 {stat['promoted']}장, 위치만 보정한 프레임 {stat['snapped']}장")
     return pages, infos, frames
 
 

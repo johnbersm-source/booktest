@@ -265,3 +265,48 @@ def test_full_run_report_classifies_unsplit_spreads(tmp_path, monkeypatch):
     assert cli.main([str(pdf), "--out", str(tmp_path / "o"), "--spread", "off"]) == 0
     rep = (tmp_path / "o" / "리포트.md").read_text(encoding="utf-8")
     assert "분리 실패 의심" in rep and "촬영 누락 의심" not in rep
+
+
+# ---- 실제 책(IMG_5899_chart) 결과에서 드러난 문제: 거의 빈 쪽 오분리, 제본선 위치 이탈 ------------------------
+
+def _strong_portrait(n: int = 4):
+    return [ms.to_portrait_frame(ms.make_spread(seed=s)[0]) for s in range(1, n + 1)]
+
+
+def test_nearly_empty_page_is_not_promoted_by_prior():
+    """글자가 거의 없는 쪽은 가운데가 비어 보이는 것이 당연하므로 '띠 확인' 으로 분리하지 않는다(대조: 글자가 있으면 구제됨)."""
+    empty = Image.new("RGB", (560, 800), (250, 248, 240))
+    ImageDraw.Draw(empty).text((60, 60), "차례", fill=(20, 20, 20))
+    near_empty = ms.to_portrait_frame(empty)
+    items = [spread.analyze(im) for im in _strong_portrait() + [near_empty]]
+    assert items[4].score < 0.3 and items[4].density < 0.4 * items[0].density
+    stat = spread.decide(items, "auto", 0.5)
+    assert stat["prior_n"] == 4 and stat["promoted"] == 0 and not items[4].decision
+
+
+def test_weak_frame_with_outlier_gutter_is_snapped_to_book_position_only_when_evidence_is_there():
+    strong = [spread.analyze(im) for im in _strong_portrait()]
+    weak = spread.analyze(ms.to_portrait_frame(ms.make_chart_spread(seed=5)))      # 점수 ≈ 0.68, x ≈ 0.5
+    assert weak.decision is False and 0.5 < weak.score < 0.8
+    weak.gutter.x, weak.gutter.x_min, weak.gutter.x_max = 0.64, 0.64, 0.64       # 검출 오류로 제본선이 크게 벗어난 상황
+    stat = spread.decide(strong + [weak], "auto", 0.5)
+    assert stat["snapped"] == 1 and weak.decision and weak.prior
+    assert weak.gutter.x == pytest.approx(0.5, abs=0.03) and "보정" in weak.reason
+    # 책이 실제로 옆으로 옮겨진 프레임(그림자도 그쪽에 있음)은 보정하지 않는다
+    moved = spread.analyze(ms.to_portrait_frame(ms.make_chart_spread(seed=6), cx=0.44))
+    own_x = moved.gutter.x
+    assert own_x < 0.47
+    spread.decide(strong + [moved], "auto", 0.5)
+    assert moved.gutter.x == pytest.approx(own_x) and not moved.prior
+
+
+def test_single_frames_are_all_listed_and_shadow_splits_do_not_warn(tmp_path):
+    srcs = []
+    for i, im in enumerate(_strong_portrait(3) + [portrait_single(2)], start=1):
+        p = tmp_path / f"p{i:04d}.png"; im.save(p); srcs.append(p)
+    logs: list[str] = []
+    _, _, frames = spread.expand_spreads_ex(srcs, tmp_path / "pi", "auto", log=logs.append)
+    from bookpdf import spread_report
+    txt = "\n".join(spread_report.summary_lines(frames, 0.5, "auto"))
+    assert "단일로 남긴 프레임 전체: 1장" in txt and "p0004.png" in txt
+    assert not any("[경고]" in l for l in logs)
