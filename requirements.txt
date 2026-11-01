@@ -1,0 +1,7 @@
+pymupdf>=1.24.3
+xhtml2pdf>=0.2.16
+markdown>=3.5
+google-genai>=1.0
+python-dotenv>=1.0
+pillow>=10.0
+numpy>=1.26
