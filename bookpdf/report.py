@@ -11,6 +11,8 @@ def low_confidence_pages(results: list[dict], threshold: float = 0.7) -> list[di
     for r in results:
         reasons = []
         text = r.get("markdown", "")
+        if r.get("dropped"):
+            continue            # --drop-junk 로 제외한 쪽: 별도 '제외한 쪽' 목록에 있음
         if r.get("embedded") and not r.get("error"):
             continue            # 원본 이미지로 삽입한 쪽(tesseract --embed-page-images)
         if r.get("error"):

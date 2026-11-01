@@ -161,7 +161,7 @@ def make_gemini_ocr(api_key: str, model: str, rpm: float, max_attempts: int = 6,
                         temperature=0,
                     ),
                 )
-                return parse_response(resp.text or "")
+                return {**parse_response(resp.text or ""), "model": model}
             except (ValueError, json.JSONDecodeError) as e:  # 형식 오류: 같은 요청을 다시 시도
                 last = e
                 log(f"  응답 형식 오류, 재시도 {attempt + 1}/{max_attempts}: {e}")

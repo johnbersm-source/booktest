@@ -8,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import glyphs, pagesel, pdf_input, pipeline, postprocess, render, report, spread, spread_report, structure
+from . import glyphs, junk, pagesel, pdf_input, pipeline, postprocess, redo, render, report, spread, spread_report, structure
 from .config import load_settings
 
 
@@ -70,6 +70,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="이번 실행에서 Gemini 호출 최대 횟수(0=환경변수 GEMINI_RPD, 그것도 없으면 무제한). 도달하면 저장 후 멈춤")
     ap.add_argument("--allow-partial", action="store_true", help="중단돼 미처리 쪽이 남아도 처리된 쪽만으로 책 PDF 생성")
     ap.add_argument("--restart", action="store_true", help="이전 중간 결과(work)를 지우고 처음부터")
+    ap.add_argument("--redo-below", type=float, default=None, metavar="CONF",
+                    help="신뢰도가 CONF(0~1] 미만인 쪽만 GEMINI_MODEL 로 다시 읽음. 기존 결과는 work/pages_prev 에 보존, "
+                         "새 결과가 더 낫지 않으면 기존 유지. GEMINI_API_KEY 필요. 예: --redo-below 0.7")
+    ap.add_argument("--drop-junk", action="store_true",
+                    help="신뢰도가 --junk-conf 미만이고 글자 수가 --junk-chars 미만인 쪽을 책 PDF 에서 제외하고 리포트에 목록(쪽 번호·이유) 기록. "
+                         "원본 이미지 삽입 쪽·제목 있는 쪽·그림 있는 쪽·처리 실패 쪽은 제외하지 않음")
+    ap.add_argument("--junk-conf", type=float, default=junk.DEFAULT_CONF, help=f"[--drop-junk] 이 신뢰도 미만이면 후보 (기본 {junk.DEFAULT_CONF})")
+    ap.add_argument("--junk-chars", type=int, default=junk.DEFAULT_CHARS, help=f"[--drop-junk] 조립된 글자 수가 이 값 미만이면 후보 (기본 {junk.DEFAULT_CHARS})")
     ap.add_argument("--max-pages", type=int, default=0, help="앞쪽 N페이지만 처리(테스트용)")
     a = ap.parse_args(argv)
 
@@ -84,6 +92,20 @@ def main(argv: list[str] | None = None) -> int:
     if not 0.0 <= a.spread_thr <= 1.0:
         print(f"[입력 오류] --spread-thr 는 0~1 사이여야 합니다(입력: {a.spread_thr}).", file=sys.stderr)
         return 2
+    if a.drop_junk and (not 0.0 < a.junk_conf <= 1.0 or a.junk_chars < 1):
+        print(f"[입력 오류] --junk-conf 는 0 초과 1 이하, --junk-chars 는 1 이상이어야 합니다(입력: {a.junk_conf}, {a.junk_chars}).", file=sys.stderr)
+        return 2
+    if a.redo_below is not None:
+        if not 0.0 < a.redo_below <= 1.0:
+            print(f"[입력 오류] --redo-below 는 0 초과 1 이하여야 합니다(입력: {a.redo_below}).", file=sys.stderr)
+            return 2
+        if a.split_only:
+            print("[입력 오류] --redo-below 는 --split-only 와 함께 쓸 수 없습니다(분리만 할 때는 OCR 을 하지 않음).", file=sys.stderr)
+            return 2
+        if not load_settings().api_key:
+            print("[입력 오류] --redo-below 는 다른 모델(Gemini)로 다시 읽는 옵션이라 GEMINI_API_KEY(.env)가 필요합니다. "
+                  "모델은 GEMINI_MODEL 로 지정합니다.", file=sys.stderr)
+            return 2
     if a.ocr == "tesseract" and not a.split_only:
         from . import ocr_tesseract
         msg = ocr_tesseract.check_available("kor+eng")
@@ -216,6 +238,21 @@ def main(argv: list[str] | None = None) -> int:
                                               pdf_page_map=pdf_map)
     pending = len(images) - len(results)
 
+    # ---- 2b. 신뢰도 낮은 쪽만 다른 모델로 재처리 (기존 결과 보존)
+    if a.redo_below is not None:
+        if stopped:
+            print("[재처리 건너뜀] 1차 처리가 중단돼 미처리 쪽이 남아 있습니다. 같은 명령을 다시 실행해 먼저 끝내세요.", file=sys.stderr)
+        else:
+            from .ocr import make_gemini_ocr
+            emb_opt = structure.EmbedOptions(a.embed_page_images, a.embed_min_chars, a.embed_min_ink)
+            redo_out = redo.redo_low_pages(
+                results, work, make_gemini_ocr(s.api_key, s.model, s.rpm), a.redo_below, s.model,
+                max_calls=a.max_calls or s.rpd,
+                skip=lambda r: r.get("engine") == "tesseract" and structure.is_picture_page(r, emb_opt))
+            if redo_out["stopped"]:
+                print(f"[재처리 중단] {redo_out['stopped']}. 지금까지의 교체분은 저장됐습니다.", file=sys.stderr)
+    extra += redo.report_lines(work)
+
     # ---- 3. 후처리
     fig_map = build_figure_map(results)
     toc_entries = None
@@ -231,11 +268,26 @@ def main(argv: list[str] | None = None) -> int:
             extra += [f"- 원본 쪽 이미지로 삽입한 쪽({len(embedded)}개, 신뢰도 점검 제외): " + ", ".join(f"p{p}" for p in embedded[:60])
                       + (" …" if len(embedded) > 60 else ""),
                       "  (글자 위주인데 그림으로 들어갔다면 `--embed-min-chars` 를 낮추고, 그림인데 글자로 나왔다면 `--embed-min-ink` 를 낮추세요)"]
-        page_mds = mds
-        md_pages = [r["page"] for r in results if r.get("engine") == "tesseract"]
+        it = iter(mds)          # 재처리로 Gemini 결과가 섞인 쪽은 그 마크다운을 쓰고, 나머지는 tesseract 조립 결과를 쓴다
+        kept = [r for r in results if r.get("engine") in ("tesseract", "gemini")]
+        page_mds = [next(it) if r["engine"] == "tesseract" else namespaced_markdown(r) for r in kept]
+        md_pages = [r["page"] for r in kept]
     else:
         page_mds = [namespaced_markdown(r) for r in results]
         md_pages = [r["page"] for r in results]
+    # 신뢰도 낮고 글자 없는 쓰레기 쪽은 조립에서만 제외(원본 결과는 보존) — 재처리(2b)와 제목 판정 이후에 판단한다
+    for r in results:
+        r["dropped"] = False
+    if a.drop_junk:
+        protect = {t["page"] for t in toc_all} if a.ocr == "tesseract" else set()
+        dropped = junk.find_junk(results, dict(zip(md_pages, page_mds)), a.junk_conf, a.junk_chars, protect)
+        gone = {d["page"] for d in dropped}
+        for r in results:
+            r["dropped"] = r["page"] in gone
+        kept = [(p, m) for p, m in zip(md_pages, page_mds) if p not in gone]
+        md_pages, page_mds = [p for p, _ in kept], [m for _, m in kept]
+        extra += junk.report_lines(dropped, len(results), a.junk_conf, a.junk_chars)
+        print(f"--drop-junk: {len(dropped)}쪽 제외" + (" (" + ", ".join(f"p{p}" for p in sorted(gone)[:20]) + (" …" if len(gone) > 20 else "") + ")" if gone else ""))
     # 글꼴에 없는 글자(한자·원문자 등)를 PDF 만들기 전에 모아 리포트에 남긴다
     glyph_found = glyphs.scan(list(zip(md_pages, page_mds)))
     glyph_lines = glyphs.format_report(glyph_found)
