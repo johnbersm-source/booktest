@@ -172,7 +172,7 @@ def normalize_line(line: str, protect: Protect | None = None, quote_style: str =
     note("nfc", out, o)
 
     o = out
-    out = "".join(unicodedata.normalize("NFKC", c) if "＀" <= c <= "￯" else c for c in out)
+    out = "".join(unicodedata.normalize("NFKC", c) if _FULLWIDTH_OK(c) else c for c in out)
     note("fullwidth", out, o)
 
     if quote_style == "straight":
