@@ -14,3 +14,14 @@ output/
 __pycache__/
 .venv/
 .pytest_cache/
+
+# 교정 파이프라인: 책 본문/정답/산출물 (커밋 금지)
+gold/
+input/
+output*/
+tess_out/
+corrected/
+proofread_out/
+glossary.txt
+glossary_auto.txt
+acronyms.txt
