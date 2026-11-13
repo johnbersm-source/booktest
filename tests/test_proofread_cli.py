@@ -148,3 +148,17 @@ def test_corrected_hanja_page_to_pdf_gemini_engine(tmp_path):
     assert cmain([str(work), "--no-llm", "--no-verify", "--apply", "--pdf", "--pdf-out", str(tmp_path / "o")], log=lambda *_: None) == 0
     t = "".join(p.get_text() for p in fitz.open(tmp_path / "o" / "책_교정.pdf"))
     assert "兵法" in t and "(1)번" in t.replace(" ", "")
+
+
+def test_pdf_evaluate_audit_alone_do_not_rerun_pipeline_or_need_key(work, tmp_path, capsys):
+    assert cmain([str(work), "--apply"], caller=tp.Scripted(), log=lambda *_: None) == 0
+    gold = tmp_path / "gold"
+    gold.mkdir()
+    for n, lines in fx.GOLD.items():
+        (gold / f"p{n:04d}.md").write_text("\n".join(lines), encoding="utf-8")
+    before = (work / "proofread" / "decisions.json").read_bytes()
+    buf, log = logs()
+    # 키 없음(autouse 가 GEMINI_API_KEY 제거) + 호출기 없음 → 실행 단계가 돌았다면 exit 2
+    assert cmain([str(work), "--pdf", "--evaluate", str(gold), "--audit", "1", "--pdf-out", str(tmp_path / "p2")], log=log) == 0
+    assert "CER: 수정 전" in "\n".join(buf) and (tmp_path / "p2" / "책_교정.pdf").exists()
+    assert (work / "proofread" / "decisions.json").read_bytes() == before

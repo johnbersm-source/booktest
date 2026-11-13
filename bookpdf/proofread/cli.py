@@ -145,6 +145,8 @@ def main(argv: list[str] | None = None, caller: Callable[..., str] | None = None
         log(f"검수 반영: 선택 {len(answers)}건 (원문 유지 {sum(1 for v in answers.values() if v['action'] == 'keep')}) / "
             f"미응답 보류 {len(held) - len(answers)}건 / 오류 {len(errs)}건")
         rc = 0
+    elif (a.pdf or a.evaluate or a.audit) and not a.apply:
+        rc = 0          # 이미 만든 교정본으로 PDF/평가/검수표만: 탐지·API 호출 없이 바로 아래 단계로
     else:
         # ---- 본 실행
         use_api = not (a.no_llm and a.no_verify)
