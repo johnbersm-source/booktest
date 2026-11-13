@@ -93,6 +93,26 @@ def _anchors(line: str, span: dict) -> tuple[str, str]:
     return " ".join(left), " ".join(right)
 
 
+def make_crop(pg: dict, span: dict, crops_dir: Path) -> tuple[bytes | None, str | None, str]:
+    """(PNG 바이트, 저장한 파일명, 모드). 쪽 이미지가 없으면 (None, None, 'no_image'). page_anchor 면 쪽 전체 축소본을 쓴다.
+    pg 가 가져야 할 키: image, lines(정규화된 줄 목록), blocks(선택), markdown_original(선택)."""
+    if not pg or not pg.get("image") or not Path(pg["image"]).exists():
+        return None, None, "no_image"
+    crops_dir = Path(crops_dir)
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    with Image.open(pg["image"]) as im:
+        im.load()
+        box, mode = locate_crop(pg, span, im.size)
+        if box:
+            data = _png(im.crop(box))
+            name = f"{span['id']}.png"
+        else:
+            data = _png(im)
+            name = f"page_p{span['page']:04d}.png"
+    (crops_dir / name).write_bytes(data)
+    return data, name, mode
+
+
 @dataclass
 class VerifyStats:
     calls_planned: int = 0
@@ -151,24 +171,17 @@ def verify_spans(spans: list[dict], cands: dict[str, list[str]], pages: dict[int
             rec["note"] = "비교할 후보 없음"
             st.mismatch += 1
             continue
-        if not pg or not pg.get("image") or not Path(pg["image"]).exists():
+        data, name, mode = make_crop(pg, s, crops_dir)
+        if data is None:
             rec["verdict"] = "no_image"
             st.no_image += 1
             continue
-        with Image.open(pg["image"]) as im:
-            im.load()
-            box, mode = locate_crop(pg, s, im.size)
-            rec["mode"] = mode
-            if box:
-                data = _png(im.crop(box))
-                prompt = PROMPT_CROP
-                crop_path = crops_dir / f"{s['id']}.png"
-                crop_path.write_bytes(data)
-                rec["crop"] = crop_path.name
-            else:
-                left, right = _anchors(pg["lines"][s["line"] - 1], s)
-                data = _png(im)
-                prompt = PROMPT_PAGE.format(left=left or "(줄 처음)", right=right or "(줄 끝)")
+        rec["mode"], rec["crop"] = mode, name
+        if mode == "page_anchor":
+            left, right = _anchors(pg["lines"][s["line"] - 1], s)
+            prompt = PROMPT_PAGE.format(left=left or "(줄 처음)", right=right or "(줄 끝)")
+        else:
+            prompt = PROMPT_CROP
         ck = key_of("verify", prompt, data)
         text = cache.get(ck) if cache else None
         if text is not None:
