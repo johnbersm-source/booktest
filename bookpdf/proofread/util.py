@@ -15,12 +15,12 @@ from pathlib import Path
 PAGE_JSON = re.compile(r"^p(\d{4,})\.json$")
 
 
-def load_pages(work: Path, only: list[int] | None = None) -> list[dict]:
+def load_pages(work: Path, only: list[int] | None = None, subdir: str = "pages") -> list[dict]:
     """work/pages/pNNNN.json → [{page, markdown, image, engine, blocks, json_path, raw}] (쪽 번호순).
 
     markdown 은 json 의 'markdown' 필드. 필드가 없으면 같은 이름의 .md 를 읽는다.
     only 가 있으면 그 쪽 번호만(없는 번호는 조용히 무시하지 않고 호출자가 확인할 수 있게 missing 으로 알린다)."""
-    res_dir = Path(work) / "pages"
+    res_dir = Path(work) / subdir if subdir else Path(work)
     if not res_dir.is_dir():
         raise FileNotFoundError(f"쪽 결과 폴더가 없습니다: {res_dir} (먼저 python -m bookpdf 로 쪽별 결과를 만드세요)")
     found: dict[int, Path] = {}

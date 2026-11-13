@@ -121,6 +121,13 @@ def decide(span: dict, cands: list[dict], llm: list[dict], ver: dict | None, lin
                    evidence=evidence, why="")
         return True
 
+    # 띄어쓰기만 바꾸는 제안(글자 순서는 그대로): 내용 환각 위험이 없으므로 이미지 근거 없이도 채택한다.
+    # 단, 글자 사이 공백(syllable_split)·두 OCR 불일치 신호가 있는 구간에 한해, 글자(공백 제외)가 한 글자도 안 바뀐 경우만.
+    sp_only = next((e for e in valid_llm if e["status"] == "proposed" and e["original"].replace(" ", "") == e["corrected"].replace(" ", "")), None)
+    if sp_only is not None and {g["name"] for g in span["signals"]} & {"syllable_split", "ocr_disagree"}:
+        if adopt(sp_only["corrected"], (sp_only["start"], sp_only["end"]), ["띄어쓰기만 변경(글자 불변)", f"LLM 확신도 {sp_only['confidence']:.2f}"]):
+            return res
+        return res
     if ver and ver["verdict"] == "supports_original":
         res.update(status="dismissed", why="이미지 재판독이 원문과 같음(오탐)", evidence=["이미지 재판독 = 원문"])
         return res

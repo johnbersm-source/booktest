@@ -7,7 +7,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
+
+FONT = Path(__file__).resolve().parents[1] / "bookpdf" / "fonts" / "NanumGothic-Regular.ttf"
 
 # 합성 정답(가짜 투자 교양서 문장). 서로 다른 쪽에 같은 용어가 반복되도록 구성.
 GOLD = {
@@ -38,8 +40,19 @@ GOLD = {
 }
 
 
+def blocks_of(md: str, size=(400, 300)) -> list[dict]:
+    """tesseract 결과의 blocks 모양을 흉내: 빈 줄로 나뉜 문단 → 블록(본문 구역, 줄 높이 20)."""
+    out, y = [], 20
+    for para in [p for p in md.split("\n\n") if p.strip()]:
+        n = para.count("\n") + 1
+        out.append({"text": para, "zone": "body", "y0": y, "y1": y + 20 * n, "x0": 20, "x1": size[0] - 20, "lh": 20.0,
+                    "lines": n, "chars": len(para), "conf": 90.0})
+        y += 20 * n + 10
+    return out
+
+
 def make_work(tmp: Path, pages: dict[int, list[str]] | None = None, engine: str = "tesseract",
-              size=(400, 300)) -> Path:
+              size=(1000, 400), blocks: bool = False) -> Path:
     """work/pages/pNNNN.json 과 가짜 쪽 이미지를 만든다. 반환: work 경로."""
     work = Path(tmp) / "work"
     (work / "pages").mkdir(parents=True, exist_ok=True)
@@ -48,11 +61,21 @@ def make_work(tmp: Path, pages: dict[int, list[str]] | None = None, engine: str 
         img = work / "page_images" / f"p{n:04d}.png"
         im = Image.new("RGB", size, "white")
         d = ImageDraw.Draw(im)
-        d.text((10, 10), f"page {n}", fill="black")
+        d.text((10, 2), f"page {n}", fill="black")
+        if blocks:                          # 실제 글자를 그려 줄마다 잘라낸 이미지가 서로 다르게 한다(번들 NanumGothic 사용)
+            font = ImageFont.truetype(str(FONT), 14)
+            for b in blocks_of("\n".join(lines), size):
+                for k, ln in enumerate(b["text"].split("\n")):
+                    d.text((b["x0"], b["y0"] + k * 20), ln, fill="black", font=font)
         im.save(img)
         md = "\n".join(lines)
         rec = {"page": n, "markdown": md, "figures": [], "confidence": 0.8, "engine": engine,
                "image": str(img), "page_number": n}
+        if blocks:
+            rec["blocks"] = blocks_of(md, size)
+            rec["size"] = list(size)
+            rec["ink"] = 0.02
+            rec["chars"] = len(md)
         (work / "pages" / f"p{n:04d}.json").write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
         (work / "pages" / f"p{n:04d}.md").write_text(md, encoding="utf-8")
     return work

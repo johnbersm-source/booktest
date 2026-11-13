@@ -41,7 +41,7 @@ def evaluated(tmp_path):
     for n, lines in fx.GOLD.items():
         if n != 4:                                  # 4쪽 정답은 일부러 없음
             (gold / f"p{n:04d}.md").write_text("\n".join(lines), encoding="utf-8")
-    opts = pl.Options(work=work)
+    opts = pl.Options(work=work, use_tsv=False)
     res = pl.run(opts, tp.Scripted(), log=lambda *a: None)
     pl.apply_run(opts, res["state"], res["decisions"])
     return work, gold, res
@@ -68,7 +68,7 @@ def test_gold_check_flags_wrong_edits(evaluated):
         def __call__(self, prompt, *, image=None, **kw):
             r = super().__call__(prompt, image=image, **kw)
             return r.replace("살아", "산아").replace("신뢰도가", "신뢰도카")
-    opts = pl.Options(work=work, corrected=work / "corrected_bad", out=work / "proofread_bad")
+    opts = pl.Options(work=work, corrected=work / "corrected_bad", out=work / "proofread_bad", use_tsv=False)
     res2 = pl.run(opts, Bad(), log=lambda *a: None)
     pl.apply_run(opts, res2["state"], res2["decisions"])
     chk2 = ev.evaluate(work, work / "corrected_bad", gold)["gold_check"]

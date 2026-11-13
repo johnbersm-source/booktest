@@ -46,6 +46,12 @@ class Scripted:
                                       "reason": "문장 다듬기", "confidence": 0.99})
             return json.dumps({"edits": edits}, ensure_ascii=False)
         self.vision_prompts.append(prompt)
+        order = list(TRUTH)         # 이미지 요청은 쪽·줄 순서(탐지 순서)대로 온다: 삼아(p1) R5I(p2) 거래랑을(p3) 신뢰드가(p5)
+        if "왼쪽 글자" not in prompt:                              # 잘라낸 이미지 모드(tsv/blocks 있음): 호출 순서로 대상 결정
+            bad = [t for t in ("삼아", "R5I", "거래랑을", "신뢰드가")][len(self.vision_prompts) - 1]
+            good = TRUTH[bad]
+            return json.dumps({"text": {"truth": good, "original": bad, "wrong": bad[:-1] + "별", "unreadable": "[판독불가]"}[self.vision_mode]},
+                              ensure_ascii=False)
         m = re.search(r'왼쪽 글자 "(.*?)" 바로 다음부터 오른쪽 글자 "(.*?)" 바로 앞까지', prompt)
         assert m, "이 테스트의 합성 쪽에는 tsv/blocks 가 없으므로 page_anchor 모드여야 함"
         left, right = m.group(1), m.group(2)
@@ -69,6 +75,7 @@ def work(tmp_path):
 
 
 def run(work, caller=None, **kw):
+    kw.setdefault("use_tsv", False)          # tesseract 설치 여부와 무관하게 결정적으로
     opts = pl.Options(work=work, **kw)
     return opts, pl.run(opts, caller, log=lambda *a: None)
 
@@ -271,3 +278,49 @@ def test_progress_and_outputs_exist(work):
         assert (out / name).exists(), name
     assert set(json.loads((out / "progress.json").read_text())["stages"]) >= {"normalize", "detect", "llm", "verify", "decide"}
     assert (out / "glossary_auto.txt").exists()
+
+
+def test_spacing_only_llm_edit_is_adopted_when_characters_unchanged(tmp_path):
+    """tesseract 가 한글 음절 사이에 공백을 넣은 경우(README 에 기록된 한계): 글자는 그대로 두고 띄어쓰기만 고치는 제안은 채택."""
+    pages = {1: ["이 동 평 균 선 은 일정 기간의 주가를 본다.", "", "거래량이 늘면 추세의 신뢰도가 커진다."]}
+    work = fx.make_work(tmp_path, pages)
+
+    def respond(prompt, *, image=None, mime=None, schema=None):
+        items = json.loads(prompt[prompt.index("검토 항목(JSON):") + len("검토 항목(JSON):"):])
+        t = items[0]["targets"][0]
+        mode = respond.mode
+        corrected = {"space": "이동평균선은", "char": "이동평균선은"[:-1] + "을", "hallu": "이동평균선은 매우"}[mode]
+        return json.dumps({"edits": [{"id": t["id"], "original": t["target"], "corrected": corrected, "reason": "띄어쓰기", "confidence": .9}]})
+    respond.mode = "space"
+    opts, res = run(work, respond, no_verify=True)
+    d = res["decisions"][0]
+    assert d["status"] == "adopted" and d["edit"]["after"] == "이동평균선은" and "띄어쓰기만 변경(글자 불변)" in d["evidence"]
+    pl.apply_run(opts, res["state"], res["decisions"])
+    assert (work / "corrected" / "p0001.md").read_text(encoding="utf-8").startswith("이동평균선은 일정")
+    assert all(ap.revert_dir(work / "corrected", work / "r").values())
+    # 글자를 바꾸거나 내용을 덧붙이는 제안은 띄어쓰기 규칙으로 채택되지 않는다
+    for mode in ("char", "hallu"):
+        respond.mode = mode
+        _, res2 = run(work, respond, no_verify=True, out=work / f"out_{mode}")
+        assert res2["decisions"][0]["status"] != "adopted", mode
+
+
+def test_clean_book_makes_no_api_calls_and_changes_nothing(tmp_path):
+    work = fx.make_work(tmp_path, fx.GOLD)
+    f = Scripted()
+    opts, res = run(work, f)
+    # 정답 책에서도 소수의 의심 구간은 나올 수 있으나(드문 낱말), 자동 수정은 0건이어야 한다(근거 없음 → 보류/오탐)
+    assert res["stats"]["adopted"] == 0
+    pl.apply_run(opts, res["state"], res["decisions"])
+    for n, lines in fx.GOLD.items():
+        got = (work / "corrected" / f"p{n:04d}.md").read_text(encoding="utf-8")
+        assert got == "\n".join(lines), n              # 정답 책은 한 글자도 바뀌지 않는다
+
+
+def test_empty_detection_still_writes_reports(tmp_path):
+    work = fx.make_work(tmp_path, {1: ["아주 평범한 문장이다. 아주 평범한 문장이다."], 2: ["아주 평범한 문장이다."]})
+    f = Scripted()
+    opts, res = run(work, f)
+    assert res["decisions"] == [] and f.calls == 0
+    paths = rp.write_reports(res["state"]["out"], res["stats"], res["decisions"], [], [])
+    assert "보류 항목 0건" in paths["html"].read_text(encoding="utf-8")
