@@ -81,3 +81,18 @@ def test_glossary_collect_and_files(tmp_path):
     g.write_text("# 주석\n삼성전자\t12\n\n한국거래소\n", encoding="utf-8")
     pr = nz.Protect.load(glossary=g, auto=f)
     assert "이동평균선" in pr and "삼성전자" in pr and "한국거래소" in pr and "주석" not in pr
+
+
+def test_fullwidth_rule_never_produces_unrenderable_glyphs():
+    """전각 규칙이 만든 글자가 번들 글꼴(NanumGothic/Noto)에 없어 PDF 에서 □ 가 되는 일이 없어야 한다."""
+    from bookpdf import glyphs
+    for cp in range(0xFF00, 0xFFF0):
+        out = n(chr(cp))
+        if out == chr(cp):
+            continue                                       # 규칙이 건드리지 않은 글자는 원래 상태 그대로
+        for ch in out:
+            if ch.isspace():
+                continue
+            assert glyphs.classify(ch) in ("ok", "cjk", "circled", "ignore"), (hex(cp), repr(out))
+    assert n("ﾡ") == "ﾡ" and n("￣") == "￣"               # 반각 한글 자모/￣ 는 그대로 둠
+    assert n("￥１００ ￦５００") == "¥100 ₩500"

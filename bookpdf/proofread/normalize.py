@@ -2,7 +2,7 @@
 
 적용 규칙(규칙 id → 설명):
   nfc          유니코드 NFC 조합, 폭 0 글자·소프트 하이픈 제거, NBSP/전각 공백 → 공백
-  fullwidth    전각/반각 폭 통일(U+FF00 대역 → NFKC, 예: ＡＢＣ１２３，→ ABC123,)
+  fullwidth    전각 ASCII·전각 기호 → 반각(ＡＢＣ１２３，→ ABC123,). 글리프가 없어지는 반각 한글/가타카나는 제외
   quote        따옴표 통일(“ ” → ",  ‘ ’ → ')   ※ quote_style="keep" 이면 건너뜀
   hyphen       하이픈·마이너스 변종(‐ ‑ ‒ − ﹣ －) → -   (en/em dash 는 건드리지 않음)
   space        연속 공백 압축, 줄 끝 공백 제거, 문장부호 앞 공백 제거("다 ." → "다.")
@@ -35,6 +35,15 @@ QUOTE_MAP = str.maketrans({"“": '"', "”": '"', "„": '"', "‟": '"', "«":
                            "‘": "'", "’": "'", "‚": "'", "‛": "'"})
 HYPHEN_MAP = str.maketrans({c: "-" for c in "‐‑‒−﹣－"})
 DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1", "|": "1"})
+
+
+def _FULLWIDTH_OK(c: str) -> bool:
+    """NFKC 로 바꿔도 NanumGothic/Noto 에 글리프가 있는 전각 글자만(전각 ASCII U+FF01~FF5E, 전각 기호 ￠￡￢￤￥￦).
+    반각 한글 자모(→ 조합용 자모, 글리프 없음)·반각 가타카나·￣(→ 공백+결합 문자)는 건드리지 않는다."""
+    o = ord(c)
+    return 0xFF01 <= o <= 0xFF5E or o in (0xFFE0, 0xFFE1, 0xFFE2, 0xFFE4, 0xFFE5, 0xFFE6)
+
+
 UNIT_FOLLOW = set("%년월일원억조만천백개명배위점호권부원달러")
 
 
